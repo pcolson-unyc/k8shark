@@ -308,6 +308,39 @@ describe("TrafficTable", () => {
       expect(screen.queryByText(/new entr/)).not.toBeInTheDocument();
     });
 
+    // Regression: writing scrollTop on every single live flush fights a
+    // trackpad's native momentum scroll (each write can look like fresh
+    // input and restart its deceleration), so the view never settles unless
+    // capture is paused. A recent real scroll event should defer the
+    // compensating write instead of racing it.
+    it("defers compensation while a scroll is active, then catches up once it settles", () => {
+      vi.useFakeTimers();
+      try {
+        const initial = [entry({ id: "b" }), entry({ id: "c" }), entry({ id: "d" })];
+        const { rerender } = render(<TrafficTable {...baseProps} entries={initial} />);
+        const scrollEl = document.querySelector(".table-wrap") as HTMLDivElement;
+
+        scrollEl.scrollTop = 100;
+        fireEvent.scroll(scrollEl); // marks a real, user-driven scroll
+
+        // A live flush arrives mid-gesture — compensation should be banked,
+        // not applied, so it doesn't collide with any in-flight native
+        // scroll animation.
+        rerender(<TrafficTable {...baseProps} entries={[entry({ id: "a" }), ...initial]} />);
+        expect(scrollEl.scrollTop).toBe(100);
+        expect(screen.queryByText(/new entr/)).not.toBeInTheDocument();
+
+        // Once the gesture has settled, the next flush applies the full
+        // banked delta in one write.
+        vi.advanceTimersByTime(200);
+        rerender(<TrafficTable {...baseProps} entries={[entry({ id: "z" }), entry({ id: "a" }), ...initial]} />);
+        expect(scrollEl.scrollTop).toBe(100 + 2 * ROW_HEIGHT);
+        expect(screen.getByText("↑ 2 new entries")).toBeInTheDocument();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     // Regression: Clear (or a filter change / range load) resets `entries`
     // to [] without touching scroll position. Left scrolled deep into the
     // old list, the viewport pointed at an offset the emptied/rebuilding

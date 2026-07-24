@@ -333,6 +333,7 @@ table.compare-meta .diff-row .kv-v { color: var(--warn); }
 .meta-item { background: var(--panel); padding: 9px 16px; display: flex; flex-direction: column; gap: 2px; }
 .meta-k { font-size: 10px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; }
 .meta-v { font-size: 12px; }
+.meta-v-sub { font-size: 11px; color: var(--text-dim); }
 .detail-flow { display: flex; align-items: center; gap: 8px; padding: 14px 16px; }
 .ep-card { flex: 1; background: var(--bg-3); border: 1px solid var(--border); border-radius: 8px; padding: 10px; min-width: 0; }
 .ep-title-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }

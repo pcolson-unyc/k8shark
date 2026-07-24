@@ -272,6 +272,22 @@ export const TrafficTable = memo(function TrafficTable({
   // compensation lands before the browser paints the shifted rows.
   const topIdRef = useRef<string | null>(null);
   const [newCount, setNewCount] = useState(0);
+
+  // A live feed can flush dozens of times a second, so without care this
+  // effect writes scrollTop just as often. Doing that while the user (or, on
+  // a trackpad, the browser's own momentum coast) is mid-scroll races the
+  // native scroll animation: each write can look like new input and restart
+  // its deceleration, so the view never settles — "scrolling never stops"
+  // until capture is paused. lastUserScrollAtRef timestamps the most recent
+  // scroll event NOT caused by our own write (ignoreNextScrollRef flags
+  // ours); while one happened within SCROLL_SETTLE_MS we bank the owed rows
+  // in pendingRowsRef instead of touching scrollTop, and apply the banked
+  // total (plus whatever's arrived since) the moment things go quiet.
+  const SCROLL_SETTLE_MS = 150;
+  const lastUserScrollAtRef = useRef(0);
+  const ignoreNextScrollRef = useRef(false);
+  const pendingRowsRef = useRef(0);
+
   useLayoutEffect(() => {
     const newTopId = displayEntries[0]?.id ?? null;
 
@@ -281,6 +297,7 @@ export const TrafficTable = memo(function TrafficTable({
     if (sort || newTopId === null) {
       topIdRef.current = newTopId;
       setNewCount(0);
+      pendingRowsRef.current = 0;
       // The buffer was wiped wholesale (Clear, a filter change, a loaded
       // range) rather than just streamed into. Leaving scrollTop wherever it
       // was points the viewport at an offset the now-empty/rebuilding list
@@ -300,8 +317,13 @@ export const TrafficTable = memo(function TrafficTable({
     if (prependedCount <= 0) return; // not found (buffer reset) or nothing prepended
 
     if (el.scrollTop > 0) {
+      pendingRowsRef.current += prependedCount;
+      const scrolling = Date.now() - lastUserScrollAtRef.current < SCROLL_SETTLE_MS;
+      if (scrolling) return; // bank it — a native scroll animation may still be in flight
+
       const before = el.scrollTop;
-      el.scrollTop = before + prependedCount * ROW_HEIGHT;
+      ignoreNextScrollRef.current = true;
+      el.scrollTop = before + pendingRowsRef.current * ROW_HEIGHT;
       // Pinned at the bottom of a capped buffer, the compensating scroll has
       // nowhere left to go — the browser clamps the write and the visible
       // rows don't actually move. Count only what really scrolled, or the
@@ -309,6 +331,7 @@ export const TrafficTable = memo(function TrafficTable({
       // user is sitting still at the end of the list.
       const movedRows = Math.round((el.scrollTop - before) / ROW_HEIGHT);
       if (movedRows > 0) setNewCount((n) => n + movedRows);
+      pendingRowsRef.current = 0;
     }
   }, [displayEntries, sort]);
 
@@ -347,6 +370,11 @@ export const TrafficTable = memo(function TrafficTable({
         ref={scrollRef}
         onScroll={(e) => {
           if (e.currentTarget.scrollTop <= 0) setNewCount(0);
+          if (ignoreNextScrollRef.current) {
+            ignoreNextScrollRef.current = false;
+          } else {
+            lastUserScrollAtRef.current = Date.now();
+          }
         }}
       >
         <table className="traffic">

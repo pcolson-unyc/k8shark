@@ -124,7 +124,7 @@ export function EntryDetail({
       <div className="detail-meta">
         <Meta k="status" v={String(entry.statusCode || entry.status || "—")} />
         <Meta k="latency" v={`${entry.elapsedMs} ms`} />
-        <Meta k="node" v={entry.nodeIp ? `${entry.node} · ${entry.nodeIp}` : entry.node} />
+        <Meta k="node" v={entry.node} sub={entry.nodeIp} />
         <Meta k="time" v={new Date(entry.timestamp).toLocaleString([], { hour12: false })} />
       </div>
 
@@ -702,11 +702,12 @@ function EndpointCard({
   );
 }
 
-function Meta({ k, v }: { k: string; v: string }) {
+function Meta({ k, v, sub }: { k: string; v: string; sub?: string }) {
   return (
     <div className="meta-item">
       <span className="meta-k">{k}</span>
       <span className="meta-v mono">{v}</span>
+      {sub && <span className="meta-v-sub mono">{sub}</span>}
     </div>
   );
 }
