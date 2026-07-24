@@ -20,7 +20,7 @@ func TestFlattenHeadersRedaction(t *testing.T) {
 		"Content-Type":  {"application/json"},
 	}
 
-	p := newPipeline(newSink("", "", "n", discardLogger()), "n", discardLogger())
+	p := newPipeline(newSink("", "", "n", discardLogger()), "n", "1.2.3.4", discardLogger())
 	p.redactHeaders = true
 	out := p.flattenHeaders(h)
 	for _, k := range []string{"authorization", "cookie", "x-api-key"} {
@@ -114,7 +114,7 @@ func TestRedactSensitiveRedisArgs(t *testing.T) {
 // off (mirrors TestFlattenHeadersRedaction's shape for HTTP).
 func TestConsumeRedisRedactsAuth(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	p.redactHeaders = true
 	rNet, rTr, sNet, sTr := flows(40001, redisPort)
 
@@ -151,7 +151,7 @@ func TestConsumeRedisRedactsAuth(t *testing.T) {
 // count (a real debugging signal — "this call bound 2 params") is preserved.
 func TestConsumePostgresRedactsBindParams(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	p.redactPGParams = true
 	rNet, rTr, sNet, sTr := flows(40031, pgPort)
 

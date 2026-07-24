@@ -55,6 +55,7 @@ spec:
             - --hub-ca=/etc/k8shark/hub-ca/ca.crt
             {{- end }}
             - --node=$(NODE_NAME)
+            - --node-ip=$(NODE_IP)
             - --iface={{ .Values.worker.iface }}
             - --log-level={{ .Values.logLevel }}
             {{- if .Values.worker.demo }}
@@ -96,6 +97,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             {{- if .Values.hub.workerToken }}
             # The worker authenticates with the dedicated worker token when
             # one is set (the worker CLI reads $K8SHARK_API_TOKEN for its hub

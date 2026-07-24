@@ -203,6 +203,7 @@ func (p *pipeline) kafkaComplete(key string, corrID int32, body []byte, raw *api
 		Timestamp:   pend.ts,
 		ElapsedMs:   now.Sub(pend.ts).Milliseconds(),
 		Node:        p.node,
+		NodeIP:      p.nodeIP,
 		Source:      pend.src,
 		Destination: pend.dst,
 		Request: api.Payload{

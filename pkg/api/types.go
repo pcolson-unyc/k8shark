@@ -262,8 +262,9 @@ type Entry struct {
 	ID          string    `json:"id"`
 	Protocol    Protocol  `json:"protocol"`
 	Timestamp   time.Time `json:"timestamp"`
-	ElapsedMs   int64     `json:"elapsedMs"` // request->response latency
-	Node        string    `json:"node"`      // capturing node/worker
+	ElapsedMs   int64     `json:"elapsedMs"`        // request->response latency
+	Node        string    `json:"node"`             // capturing node/worker
+	NodeIP      string    `json:"nodeIp,omitempty"` // capturing node's host IP (status.hostIP; empty when not injected, e.g. demo mode)
 	Source      Endpoint  `json:"src"`
 	Destination Endpoint  `json:"dst"`
 	Request     Payload   `json:"request"`

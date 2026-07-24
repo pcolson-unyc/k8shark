@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useHub } from "./useHub";
 import { StatsHeader } from "./components/StatsHeader";
 import { FilterBar } from "./components/FilterBar";
@@ -8,6 +8,7 @@ import { EntryDetail } from "./components/EntryDetail";
 import { ServiceMap } from "./components/ServiceMap";
 import { TopView } from "./components/TopView";
 import { CompareView } from "./components/CompareView";
+import { KonamiShark } from "./components/KonamiShark";
 import { isTypingTarget } from "./dom";
 import type { Entry } from "./types";
 
@@ -57,6 +58,42 @@ export function App() {
   const [pinned, setPinned] = useState<Entry[]>([]);
   const [showCompare, setShowCompare] = useState(false);
 
+  // Selecting a row to read its detail auto-pauses the live stream (unless
+  // already paused), so the table doesn't keep scrolling out from under
+  // whatever you're analyzing; closing the panel resumes it. autoPausedRef
+  // tracks whether the *current* pause came from that auto-pause rather than
+  // an explicit user choice, so closing the panel only resumes what selecting
+  // it paused — a pause the user set manually (button, spacebar) before or
+  // during selection is left alone.
+  const autoPausedRef = useRef(false);
+
+  const selectEntry = useCallback(
+    (e: Entry) => {
+      if (!paused) {
+        autoPausedRef.current = true;
+        setPaused(true);
+      }
+      setSelected(e);
+    },
+    [paused, setPaused]
+  );
+
+  const closeSelection = useCallback(() => {
+    setSelected(null);
+    if (autoPausedRef.current) {
+      autoPausedRef.current = false;
+      setPaused(false);
+    }
+  }, [setPaused]);
+
+  // Any explicit pause/resume (button or spacebar) takes ownership away from
+  // the auto-pause bookkeeping above, so closing the detail panel afterward
+  // won't override what the user just chose.
+  const togglePauseManual = useCallback(() => {
+    autoPausedRef.current = false;
+    setPaused(!paused);
+  }, [paused, setPaused]);
+
   // Pin up to two entries for the compare view; pinning a third drops the
   // oldest pin. Pinning holds a snapshot of the entry, not just its id, so a
   // pin survives the entry aging out of the live buffer.
@@ -71,7 +108,7 @@ export function App() {
   const onApply = (f: string) => {
     setFilter(f);
     hub.applyFilter(f);
-    setSelected(null);
+    closeSelection();
   };
 
   // Resolve a ?entry=<id> permalink on first load. Not necessarily in the
@@ -81,8 +118,14 @@ export function App() {
     if (!id) return;
     fetch(`/api/entry/${encodeURIComponent(id)}`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((e) => e && setSelected(e))
+      .then((e) => e && selectEntry(e))
       .catch(() => {});
+    // selectEntry is intentionally omitted: this must run exactly once, at
+    // mount, against the URL as it was on page load. selectEntry's identity
+    // changes with hub.paused, so including it would re-run this on every
+    // later pause/resume — re-fetching the same permalink and, worse,
+    // re-triggering auto-pause each time the user manually resumes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Keep the URL in sync with filter/view/selection so the current view is
@@ -119,14 +162,15 @@ export function App() {
         document.getElementById("filter-input")?.focus();
       } else if (e.key === " " && document.activeElement === document.body) {
         e.preventDefault();
+        autoPausedRef.current = false;
         setPaused(!paused);
       } else if (e.key === "Escape") {
-        setSelected(null);
+        closeSelection();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [paused, setPaused]);
+  }, [paused, setPaused, closeSelection]);
 
   // Index the live buffer by id once per change so the selected-entry lookup
   // below is O(1) instead of an entries.find() linear scan on every render —
@@ -148,6 +192,7 @@ export function App() {
 
   return (
     <div className="app">
+      <KonamiShark />
       <StatsHeader
         stats={hub.stats}
         statsHistory={hub.statsHistory}
@@ -162,7 +207,7 @@ export function App() {
         onApply={onApply}
         paused={hub.paused}
         pausedCount={hub.pausedCount}
-        onTogglePause={() => hub.setPaused(!hub.paused)}
+        onTogglePause={togglePauseManual}
         onClear={hub.clear}
         view={view}
         onViewChange={setView}
@@ -179,7 +224,7 @@ export function App() {
           <TrafficTable
             entries={hub.entries}
             selectedId={selectedLive?.id ?? null}
-            onSelect={setSelected}
+            onSelect={selectEntry}
             onLoadOlder={hub.loadOlder}
             loadingOlder={hub.loadingOlder}
             noMoreHistory={hub.noMoreHistory}
@@ -188,7 +233,7 @@ export function App() {
             onCompare={() => setShowCompare(true)}
           />
           {selectedLive && (
-            <EntryDetail entry={selectedLive} onClose={() => setSelected(null)} onApply={onApply} />
+            <EntryDetail entry={selectedLive} onClose={closeSelection} onApply={onApply} />
           )}
           {showCompare && pinned.length === 2 && (
             <CompareView a={pinned[0]} b={pinned[1]} onClose={() => setShowCompare(false)} />

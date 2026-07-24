@@ -16,7 +16,7 @@ echo "starting hub on :$PORT (serving ui/dist) + demo worker"
 "$BIN" hub --serve-ui ui/dist --port "$PORT" &
 HUB=$!
 sleep 1
-"$BIN" worker --hub "ws://localhost:$PORT/ws/worker" --node dev-node --demo --demo-rps 40 &
+"$BIN" worker --hub "ws://localhost:$PORT/ws/worker" --node dev-node --node-ip 127.0.0.1 --demo --demo-rps 40 &
 WK=$!
 
 trap 'kill $HUB $WK 2>/dev/null || true' EXIT INT TERM

@@ -517,10 +517,6 @@ func (s *Server) handleFront(w http.ResponseWriter, r *http.Request) {
 		pred: pred,
 	}
 
-	s.mu.Lock()
-	s.frontClients[c] = struct{}{}
-	s.mu.Unlock()
-
 	s.log.Debug("front client connected", "remote", r.RemoteAddr)
 
 	if filterErr != nil {
@@ -529,9 +525,20 @@ func (s *Server) handleFront(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Replay recent history that matches the initial filter, then the stats.
-	s.replayHistory(c)
+	// Snapshot history *before* registering c for live broadcast, not after:
+	// store.add() always runs before broadcast() (see the MsgEntry handler
+	// below), so an entry that lands in the gap between the two would
+	// otherwise be caught by both — once in this replay's snapshot, once
+	// again ~30ms later via the live broadcast flush once c is registered —
+	// and show up as a duplicate row in the UI. Registering after avoids
+	// that at the cost of a vanishingly rare single missed entry landing in
+	// this now much narrower gap, which is the better trade for a live feed.
+	s.replayHistory(c, pred)
 	c.trySend(s.statsBytes())
+
+	s.mu.Lock()
+	s.frontClients[c] = struct{}{}
+	s.mu.Unlock()
 
 	go s.frontReader(c)
 	s.frontWriter(c)
@@ -562,12 +569,16 @@ func (s *Server) frontReader(c *frontClient) {
 				}
 				continue // keep previous filter on parse error
 			}
+			// Snapshot under the new predicate *before* switching c.pred over —
+			// flushBroadcast() matches against whatever c.pred is at flush time
+			// (up to ~30ms after an entry is queued), so swapping it first would
+			// let an entry landing in the gap match both this replay and a
+			// subsequent live broadcast, arriving twice. See the matching
+			// comment in handleFront.
+			s.replayHistory(c, pred)
 			c.mu.Lock()
 			c.pred = pred
 			c.mu.Unlock()
-			// Resend matching history so a live filter swap surfaces the past,
-			// not just future traffic (the client cleared its table on change).
-			s.replayHistory(c)
 		}
 	}
 }
@@ -577,15 +588,14 @@ func (s *Server) frontReader(c *frontClient) {
 // from 500 frames into a handful.
 const replayBatchSize = 100
 
-// replayHistory resends up to 500 recent entries matching the client's current
-// predicate, oldest first so the UI appends chronologically, as chunked
-// MsgEntryBatch frames assembled from the store's cached JSON — no
-// re-marshaling per connection or filter swap. Used on initial connect and
-// after a live filter swap.
-func (s *Server) replayHistory(c *frontClient) {
-	c.mu.RLock()
-	pred := c.pred
-	c.mu.RUnlock()
+// replayHistory resends up to 500 recent entries matching pred, oldest first
+// so the UI appends chronologically, as chunked MsgEntryBatch frames
+// assembled from the store's cached JSON — no re-marshaling per connection or
+// filter swap. Used on initial connect and after a live filter swap. pred is
+// taken as a parameter rather than read from c.pred so callers can snapshot
+// under it before c.pred (and therefore live broadcast matching) switches
+// over — see the callers' comments.
+func (s *Server) replayHistory(c *frontClient, pred Predicate) {
 	history := s.store.recentRaw(500, pred) // newest first
 	// Walk chunks from the slice's tail (the oldest entries) toward its head,
 	// reversing within each chunk, so the client sees strict chronological

@@ -170,11 +170,14 @@ spec:
             - worker
             - --hub=ws://k8shark-hub.k8shark.svc:8898/ws/worker
             - --node=$(NODE_NAME)
+            - --node-ip=$(NODE_IP)
             - --iface=
             - --log-level=info
           env:
             - name: NODE_NAME
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: NODE_IP
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
           securityContext:
             privileged: true
             capabilities:

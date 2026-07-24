@@ -19,7 +19,7 @@ import (
 // fuzzPipeline builds a throwaway sink+pipeline for one fuzz iteration.
 func fuzzPipeline() (*pipeline, *sink) {
 	s := newSink("", "", "n", discardLogger())
-	return newPipeline(s, "n", discardLogger()), s
+	return newPipeline(s, "n", "1.2.3.4", discardLogger()), s
 }
 
 func FuzzConsumeRedis(f *testing.F) {

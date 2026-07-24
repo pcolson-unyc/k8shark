@@ -113,7 +113,7 @@ func TestRedisRESPRendering(t *testing.T) {
 
 func TestRedisPairingEndToEnd(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40000, redisPort)
 
 	req := "*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n" + "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
@@ -141,7 +141,7 @@ func TestRedisPairingEndToEnd(t *testing.T) {
 // backward-compatible and opt-in only.
 func TestConsumeStreamDefaultPortIsRedis(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40020, redisPort)
 
 	req := "*1\r\n$4\r\nPING\r\n"
@@ -164,7 +164,7 @@ func TestConsumeStreamDefaultPortIsRedis(t *testing.T) {
 // bytes on the wire are indistinguishable from Redis.
 func TestConsumeStreamConfiguredPortIsValkey(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	const valkeyPort = 16379
 	p.respPorts = buildRespPorts(nil, []int{valkeyPort})
 	rNet, rTr, sNet, sTr := flows(40021, valkeyPort)
@@ -212,7 +212,7 @@ func TestBuildRespPorts(t *testing.T) {
 // falling into the HTTP sniff and being lost as a bare TCP flow.
 func TestConsumeStreamNonStandardPortSniffsRedis(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	const oddPort = 16380 // not 6379, not configured, not pg/amqp
 	rNet, rTr, sNet, sTr := flows(40022, oddPort)
 
@@ -236,7 +236,7 @@ func TestConsumeStreamNonStandardPortSniffsRedis(t *testing.T) {
 // HTTP) — a regression guard for the common case.
 func TestConsumeStreamNonStandardPortFallsBackToHTTP(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	const oddPort = 18080
 	rNet, rTr, sNet, sTr := flows(40023, oddPort)
 
@@ -277,7 +277,7 @@ func pgStartup() []byte { // SSLRequest: len=8, code=80877103
 
 func TestPostgresPairingEndToEnd(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40001, pgPort)
 
 	// Requests: startup (skipped) + Simple Query + extended Parse/Execute.
@@ -317,7 +317,7 @@ func TestPostgresPairingEndToEnd(t *testing.T) {
 
 func TestPostgresError(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40002, pgPort)
 
 	req := pgMsg('Q', []byte("SELECT * FROM nope\x00"))
@@ -368,7 +368,7 @@ func TestRESP3MapSingleReply(t *testing.T) {
 // An unsolicited pub/sub message must not steal a pending request's response.
 func TestRedisPubSubNotMispaired(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40010, redisPort)
 
 	req := "*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n" + "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"
@@ -450,7 +450,7 @@ func pgRowDesc(cols ...pgCol) []byte {
 // Extended-query Parse+Bind+Execute -> typed params/columns/tag on the entry.
 func TestPostgresExtendedDetail(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40030, pgPort)
 
 	var req []byte
@@ -490,7 +490,7 @@ func TestPostgresExtendedDetail(t *testing.T) {
 // ErrorResponse -> typed PGError fields.
 func TestPostgresErrorDetail(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40031, pgPort)
 
 	req := pgMsg('Q', []byte("SELECT * FROM nope\x00"))
@@ -520,7 +520,7 @@ func TestPostgresErrorDetail(t *testing.T) {
 // ReplyType/Attributes.
 func TestRedisDetail(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40040, redisPort)
 
 	req := "*2\r\n$6\r\nSELECT\r\n$1\r\n2\r\n" + "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"
@@ -565,7 +565,7 @@ func TestRESP3MapReplyType(t *testing.T) {
 // A NOERROR response with multiple A answers -> DNSDetail.Answers/Rcode.
 func TestDNSAnswerDetail(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	reqNet, _, respNet, _ := flows(50000, 53)
 
 	q := &layers.DNS{ID: 7, Questions: []layers.DNSQuestion{{Name: []byte("svc.local"), Type: layers.DNSTypeA, Class: layers.DNSClassIN}}}
@@ -605,7 +605,7 @@ func TestDNSAnswerDetail(t *testing.T) {
 
 func TestDNSNXDomainDetail(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	reqNet, _, respNet, _ := flows(50001, 53)
 
 	q := &layers.DNS{ID: 8, Questions: []layers.DNSQuestion{{Name: []byte("nope.local"), Type: layers.DNSTypeA, Class: layers.DNSClassIN}}}
@@ -659,7 +659,7 @@ func dnsTCPFrame(payload []byte) []byte {
 // port-53 case in consumeStreamID.
 func TestDNSOverTCPPairing(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	cli := connID{srcIP: "10.0.0.1", dstIP: "10.0.0.2", srcPort: 40200, dstPort: 53}
 	srv := connID{srcIP: "10.0.0.2", dstIP: "10.0.0.1", srcPort: 53, dstPort: 40200}
 
@@ -704,7 +704,7 @@ func TestDNSOverTCPPairing(t *testing.T) {
 // client port, not just IP+ID.
 func TestDNSSameIDDistinctSourcePorts(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	reqNet, _, respNet, _ := flows(50002, 53)
 
 	mkQ := func(name string) *layers.DNS {
@@ -738,7 +738,7 @@ func TestDNSSameIDDistinctSourcePorts(t *testing.T) {
 // bytes than the stream holds) must not panic and must emit nothing.
 func TestDNSOverTCPTruncatedFrame(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	cli := connID{srcIP: "10.0.0.1", dstIP: "10.0.0.2", srcPort: 40201, dstPort: 53}
 
 	for _, stream := range [][]byte{
@@ -780,7 +780,7 @@ const amqpHeader = "AMQP\x00\x00\x09\x01"
 // Basic.Publish + content header + body -> one entry with exchange/rk/body.
 func TestAMQPBasicPublish(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40100, amqpPort)
 
 	// Basic.Publish args: reserved short(0) + exchange + routing-key + bits(1).
@@ -829,7 +829,7 @@ func TestAMQPBasicPublish(t *testing.T) {
 // order past the field-table.
 func TestAMQPBasicProperties(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40120, amqpPort)
 
 	var args []byte
@@ -890,7 +890,7 @@ func TestAMQPBasicProperties(t *testing.T) {
 // content entry (bodySize=0 here, so it completes on the header alone).
 func TestAMQPBasicPropertiesTruncated(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40121, amqpPort)
 
 	var args []byte
@@ -921,7 +921,7 @@ func TestAMQPBasicPropertiesTruncated(t *testing.T) {
 // Queue.Declare surfaces without any content frames.
 func TestAMQPQueueDeclare(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40101, amqpPort)
 
 	var args []byte
@@ -946,7 +946,7 @@ func TestAMQPQueueDeclare(t *testing.T) {
 // Connection.Close with a >=400 reply-code is an error entry.
 func TestAMQPConnectionCloseIsError(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40102, amqpPort)
 
 	var args []byte
@@ -970,7 +970,7 @@ func TestAMQPConnectionCloseIsError(t *testing.T) {
 // A frame whose frame-end byte != 0xCE (garbled/TLS) must bail without emitting.
 func TestAMQPFramingGuard(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40103, amqpPort)
 
 	frame := amqpFrame(amqpFrameMethod, 1, amqpMethod(amqpClassQueue, 10, append(appendU16(nil, 0), amqpShortStrBytes("q")...)))
@@ -986,7 +986,7 @@ func TestAMQPFramingGuard(t *testing.T) {
 // An AMQP 1.0 protocol header must be detected and skipped (no entries, no panic).
 func TestAMQP10Skipped(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40104, amqpPort)
 
 	stream := "AMQP\x00\x01\x00\x00" + "some 1.0 performative junk that must not parse"
@@ -1000,7 +1000,7 @@ func TestAMQP10Skipped(t *testing.T) {
 // A port configured as Valkey emits ProtocolValkey entries (label-only relabel).
 func TestValkeyLabel(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	p.respPorts = buildRespPorts(nil, []int{6380})
 	rNet, rTr, sNet, sTr := flows(40105, 6380)
 
@@ -1020,7 +1020,7 @@ func TestValkeyLabel(t *testing.T) {
 // StartupMessage — two consecutive untyped messages. Both must be skipped.
 func TestPostgresSSLPreferDoubleUntyped(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40011, pgPort)
 
 	var req []byte
@@ -1045,7 +1045,7 @@ func TestPostgresSSLPreferDoubleUntyped(t *testing.T) {
 // calls proves it's an actual duration, not a dead always-zero field.
 func TestHTTPTTFB(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40200, 80)
 
 	p.consumeHTTP(rNet, rTr, strings.NewReader("GET /x HTTP/1.1\r\nHost: h\r\n\r\n"))
@@ -1072,7 +1072,7 @@ func TestHTTPTTFB(t *testing.T) {
 // never has one, but net/http only knows that when told the request method.
 func TestHTTPHeadResponseNotDesynced(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40300, 80)
 
 	p.consumeHTTP(rNet, rTr, strings.NewReader(
@@ -1102,7 +1102,7 @@ func TestHTTPHeadResponseNotDesynced(t *testing.T) {
 // connection onto the wrong request.
 func TestHTTPInterimResponseNotPaired(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40301, 80)
 
 	p.consumeHTTP(rNet, rTr, strings.NewReader(
@@ -1160,7 +1160,7 @@ func TestHTTPTraceIDExtraction(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			s := newSink("", "", "n", discardLogger())
-			p := newPipeline(s, "n", discardLogger())
+			p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 			rNet, rTr, sNet, sTr := flows(40800, 80)
 
 			req := "GET /x HTTP/1.1\r\nHost: h\r\n" + c.headers + "\r\n"
@@ -1185,7 +1185,7 @@ func TestHTTPTraceIDExtraction(t *testing.T) {
 // following CommandComplete still pairs with the query.
 func TestPostgresHugeDataRowSkipped(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40401, pgPort)
 
 	req := pgMsg('Q', []byte("SELECT blob FROM t\x00"))
@@ -1210,7 +1210,7 @@ func TestPostgresHugeDataRowSkipped(t *testing.T) {
 // discarded without allocating or desyncing: the query after it still parses.
 func TestPostgresHugeCopyDataSkipped(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40402, pgPort)
 
 	var req []byte
@@ -1234,7 +1234,7 @@ func TestPostgresHugeCopyDataSkipped(t *testing.T) {
 // on the wire: the next command on the connection must still parse.
 func TestRedisOversizedBulkTruncatedNotDesynced(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40403, redisPort)
 
 	big := strings.Repeat("a", maxRESPCapture+3)
@@ -1261,7 +1261,7 @@ func TestRedisOversizedBulkTruncatedNotDesynced(t *testing.T) {
 // emitted, with the true body size) and the next frame still parses.
 func TestAMQPOversizedBodyFrame(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40404, amqpPort)
 
 	bodySize := amqpMaxCapture + 5
@@ -1357,7 +1357,7 @@ func wsEntriesBySide(entries []*api.Entry, clientPort int) (client, server []*ap
 // abandoning the whole connection (the DIS-6 bug).
 func TestWebSocketUpgradeAndTextFrames(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	const clientPort = 40500
 	rNet, rTr, sNet, sTr := flows(clientPort, 80)
 
@@ -1399,7 +1399,7 @@ func TestWebSocketUpgradeAndTextFrames(t *testing.T) {
 // A close frame must be surfaced as a ws entry noting its RFC 6455 close code.
 func TestWebSocketCloseFrame(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	const clientPort = 40600
 	rNet, rTr, sNet, sTr := flows(clientPort, 80)
 
@@ -1440,7 +1440,7 @@ func TestWebSocketGarbledFrameNoPanic(t *testing.T) {
 	for name, garbled := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := newSink("", "", "n", discardLogger())
-			p := newPipeline(s, "n", discardLogger())
+			p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 			rNet, rTr, sNet, sTr := flows(40700, 80)
 
 			p.consumeHTTP(rNet, rTr, strings.NewReader(wsUpgradeReq))
@@ -1532,7 +1532,7 @@ func TestLossReaderTruncatesDrainsAndCounts(t *testing.T) {
 // and the loss is counted for /api/workers + /metrics.
 func TestTCPLossPurgesPendingAndCounts(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40000, redisPort)
 
 	// Two requests, both fully sent before any loss (request direction is clean).
@@ -1606,7 +1606,7 @@ func comQueryPacket(sql string) []byte {
 // surfaces the SQL text, row count and error.
 func TestMySQLPairingEndToEnd(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40400, mysqlPort)
 
 	// Request direction: a (skipped) handshake response at seq 1, then three
@@ -1666,7 +1666,7 @@ func TestMySQLPairingEndToEnd(t *testing.T) {
 // TLS ciphertext as MySQL packets.
 func TestMySQLSSLUpgradeStopsCleanly(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, _, _ := flows(40404, mysqlPort)
 
 	var req []byte
@@ -1687,7 +1687,7 @@ func TestMySQLSSLUpgradeStopsCleanly(t *testing.T) {
 // Truncated / garbled MySQL streams must not panic and must emit nothing.
 func TestMySQLTruncatedNoPanic(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40405, mysqlPort)
 
 	for _, stream := range [][]byte{
@@ -1751,7 +1751,7 @@ func opMsgMsg(requestID, responseTo int32, doc []byte) []byte {
 // and an ok:0 + errmsg reply, surfacing collection/command and the error.
 func TestMongoOpMsgPairing(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40500, mongoPort)
 
 	req := opMsgMsg(100, 0, bsonDoc(bsonStrElem("find", "users"), bsonStrElem("$db", "shop")))
@@ -1794,7 +1794,7 @@ func TestMongoOpMsgPairing(t *testing.T) {
 // truncated BSON) must not panic and must emit nothing.
 func TestMongoTruncatedNoPanic(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40501, mongoPort)
 
 	// A BSON doc whose string value claims far more bytes than are present.
@@ -1868,7 +1868,7 @@ func kafkaProduceRespPayload(corrID int32, topic string, errCode int16) []byte {
 // api_key name, version, topic and client id.
 func TestKafkaProducePairing(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40600, kafkaPort)
 
 	req := kafkaFrame(append(kafkaReqHeaderBytes(0, 7, 42, "producer-1"), kafkaProduceReqBody("orders")...))
@@ -1912,7 +1912,7 @@ func TestKafkaProducePairing(t *testing.T) {
 // error path.
 func TestKafkaOutOfOrderCorrelation(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40601, kafkaPort)
 
 	// Metadata(corr=1, topic=events) then Produce(corr=2, topic=orders).
@@ -1958,7 +1958,7 @@ func TestKafkaOutOfOrderCorrelation(t *testing.T) {
 // truncated body) must not panic and must emit nothing.
 func TestKafkaTruncatedNoPanic(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40602, kafkaPort)
 
 	streams := [][]byte{
@@ -1983,7 +1983,7 @@ func TestKafkaTruncatedNoPanic(t *testing.T) {
 // a topic — and neither side panics.
 func TestKafkaFlexibleVersionSurfaced(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40603, kafkaPort)
 
 	// Header fields stay fixed-position (incl. the non-compact client_id); the

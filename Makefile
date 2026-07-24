@@ -38,7 +38,7 @@ run-hub: build
 
 ## run a demo worker against a local hub
 run-worker: build
-	$(BINARY) worker --hub ws://localhost:8898/ws/worker --node dev --demo --demo-rps 40
+	$(BINARY) worker --hub ws://localhost:8898/ws/worker --node dev --node-ip 127.0.0.1 --demo --demo-rps 40
 
 ## build UI + start hub + demo worker together (local, no cluster)
 dev: ui build

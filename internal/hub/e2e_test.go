@@ -241,7 +241,7 @@ func TestReplayHistoryChunksChronological(t *testing.T) {
 		s.store.add(httpEntry(fmt.Sprintf("e%03d", i)))
 	}
 	c := &frontClient{send: make(chan []byte, 16)}
-	s.replayHistory(c)
+	s.replayHistory(c, nil)
 	close(c.send)
 
 	var ids []string
@@ -269,6 +269,61 @@ func TestReplayHistoryChunksChronological(t *testing.T) {
 		if ids[i-1] >= ids[i] {
 			t.Fatalf("chronological order breaks at %d: %s >= %s", i, ids[i-1], ids[i])
 		}
+	}
+}
+
+// TestConnectSnapshotBeforeRegisterAvoidsDuplicate is a regression test for a
+// hub-side race that showed up in the UI as duplicate ("ghost") rows right
+// after a page reload: store.add() always runs before broadcast() (see the
+// MsgEntry handler in server.go), so a client that gets registered into
+// s.frontClients *before* its history snapshot is taken can have an entry
+// land in the gap and be delivered twice — once in the snapshot, once again
+// via the live broadcast flush now that it's registered. handleFront and
+// frontReader's filter-swap handler now snapshot first and register/switch
+// c.pred after, closing that window. This drives the same primitives by hand
+// (flushing on demand instead of waiting out the real 30ms timer) to place an
+// entry's broadcast() call exactly in that gap and assert it isn't
+// duplicated, plus that ordinary post-registration live delivery still
+// works.
+func TestConnectSnapshotBeforeRegisterAvoidsDuplicate(t *testing.T) {
+	s := New(discardLogger(), Options{})
+	c := &frontClient{send: make(chan []byte, 16)}
+
+	// e1 is already in the store by the time the snapshot is taken.
+	e1 := httpEntry("e1")
+	raw1 := s.store.add(e1)
+	s.replayHistory(c, nil) // mirrors handleFront: snapshot before registering
+
+	// Its broadcast() call (made by the worker-ingest goroutine, independent
+	// of handleFront's timing) lands in the gap between the snapshot above
+	// and registration below — the exact window this fix narrows.
+	s.broadcast(e1, raw1)
+
+	s.mu.Lock()
+	s.frontClients[c] = struct{}{}
+	s.mu.Unlock()
+
+	s.flushBroadcast() // simulate the 30ms timer firing
+
+	// e2 arrives normally, after c is registered: ordinary live delivery.
+	e2 := httpEntry("e2")
+	raw2 := s.store.add(e2)
+	s.broadcast(e2, raw2)
+	s.flushBroadcast()
+
+	close(c.send)
+	var ids []string
+	for b := range c.send {
+		var env api.Envelope
+		if err := json.Unmarshal(b, &env); err != nil {
+			t.Fatalf("decode frame: %v", err)
+		}
+		for _, e := range env.Entries {
+			ids = append(ids, e.ID)
+		}
+	}
+	if len(ids) != 2 || ids[0] != "e1" || ids[1] != "e2" {
+		t.Fatalf("got ids %v, want exactly one delivery each of [e1 e2]", ids)
 	}
 }
 

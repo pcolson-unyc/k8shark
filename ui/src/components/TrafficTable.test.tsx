@@ -402,6 +402,30 @@ describe("TrafficTable", () => {
       expect(summaries()).toEqual(["zippy", "slow", "fast", "mid"]);
       expect(screen.queryByRole("button", { name: /stream frozen/i })).not.toBeInTheDocument();
     });
+
+    // Regression: Clear (or a filter change) wipes `entries` wholesale, but a
+    // frozen sort's displayed rows come from frozenBase, not entries — so the
+    // wipe went unnoticed and pre-Clear rows kept showing under a permanently
+    // stale "stream frozen" banner. Especially visible with capture paused,
+    // since nothing ever arrives afterward to reveal the staleness via a
+    // rising "N new" count.
+    it("drops the sort (and its frozen snapshot) when entries is wiped wholesale, instead of showing stale rows forever", async () => {
+      const user = userEvent.setup();
+      const initial = bySpeed();
+      const { rerender } = render(<TrafficTable {...baseProps} entries={initial} />);
+
+      await user.click(screen.getByText("latency")); // asc: fast, mid, slow
+      expect(summaries()).toEqual(["fast", "mid", "slow"]);
+
+      rerender(<TrafficTable {...baseProps} entries={[]} />);
+      expect(summaries()).toEqual([]);
+      expect(screen.getByText(/Waiting for traffic/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /stream frozen/i })).not.toBeInTheDocument();
+
+      // Normal live behavior resumes for whatever streams in next.
+      rerender(<TrafficTable {...baseProps} entries={[entry({ id: "fresh" })]} />);
+      expect(summaries()).toEqual(["GET /"]);
+    });
   });
 
   // Loosely covers the App-side selectedLive fix (UI-8): the table must stay

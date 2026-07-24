@@ -178,6 +178,14 @@ export const TrafficTable = memo(function TrafficTable({
   // moment it's null.
   if (sort && frozenBase === null) setFrozenBase(entries);
   else if (!sort && frozenBase !== null) setFrozenBase(null);
+  // entries is wiped wholesale on Clear / a filter change / a loaded range
+  // (see the scroll-compensation effect below). While sorted, displayEntries
+  // is frozenBase's stale snapshot rather than entries itself, so that wipe
+  // otherwise goes unnoticed here — the table would keep showing pre-wipe
+  // rows under a "stream frozen" banner forever. Dropping the sort drops
+  // frozenBase with it (the branch above) and falls back to the now-empty
+  // entries.
+  else if (sort && entries.length === 0) setSort(null);
 
   // Keyed on [sort, frozenBase] — deliberately NOT on `entries` — so a live
   // flush (new `entries` ref every frame) never re-triggers the sort. It runs

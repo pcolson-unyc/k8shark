@@ -16,7 +16,7 @@ func TestRunDemoRespectsPause(t *testing.T) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		runDemo(s, "n", 1000, stop) // high rps: a few ms is many opportunities to (wrongly) emit
+		runDemo(s, "n", "1.2.3.4", 1000, stop) // high rps: a few ms is many opportunities to (wrongly) emit
 		close(done)
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -34,7 +34,7 @@ func TestRunDemoRespectsPause(t *testing.T) {
 	stop = make(chan struct{})
 	done = make(chan struct{})
 	go func() {
-		runDemo(s, "n", 1000, stop)
+		runDemo(s, "n", "1.2.3.4", 1000, stop)
 		close(done)
 	}()
 	time.Sleep(20 * time.Millisecond)

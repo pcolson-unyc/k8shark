@@ -25,6 +25,7 @@ type Options struct {
 	HubToken string // bearer token for the hub connection ("" = no auth)
 	HubCA    string // PEM file with the CA verifying a wss:// hub cert ("" = system roots)
 	Node     string // node name this worker reports as
+	NodeIP   string // node's host IP this worker reports as ("" = omitted from entries)
 	Iface    string // capture interface ("" = any)
 	Demo     bool   // force synthetic traffic instead of live capture
 	DemoRPS  int    // synthetic entries/sec in demo mode
@@ -93,13 +94,13 @@ func Run(ctx context.Context, log *slog.Logger, opts Options) error {
 
 	if opts.Demo {
 		log.Info("worker started (demo mode)", "node", opts.Node, "rps", opts.DemoRPS)
-		runDemo(s, opts.Node, opts.DemoRPS, stop)
+		runDemo(s, opts.Node, opts.NodeIP, opts.DemoRPS, stop)
 		return nil
 	}
 
 	// AF_PACKET and eBPF TLS both feed one pipeline and are independent: either
 	// can be unavailable without disabling the other. Build the pipeline first.
-	p := newPipeline(s, opts.Node, log)
+	p := newPipeline(s, opts.Node, opts.NodeIP, log)
 	if len(opts.RedisPorts) > 0 || len(opts.ValkeyPorts) > 0 {
 		p.respPorts = buildRespPorts(opts.RedisPorts, opts.ValkeyPorts)
 	}

@@ -422,6 +422,7 @@ func (p *pipeline) emitAMQP(isClient bool, c connID, req, resp api.Payload, stat
 		Protocol:    api.ProtocolAMQP,
 		Timestamp:   time.Now(),
 		Node:        p.node,
+		NodeIP:      p.nodeIP,
 		Source:      src,
 		Destination: dst,
 		Request:     req,

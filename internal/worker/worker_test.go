@@ -88,7 +88,7 @@ func mkICMPv6Packet(t *testing.T, src, dst string, tc layers.ICMPv6TypeCode) gop
 // TCP/UDP either) — dual-stack/IPv6-only traffic was silently invisible.
 func TestRouteDispatchesICMPv6(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 
 	tc := layers.CreateICMPv6TypeCode(layers.ICMPv6TypeDestinationUnreachable, layers.ICMPv6CodeNoRouteToDst)
 	pkt := mkICMPv6Packet(t, "2001:db8::1", "2001:db8::2", tc)

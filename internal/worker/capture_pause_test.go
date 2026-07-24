@@ -69,7 +69,7 @@ func waitForBool(t *testing.T, get func() bool, want bool, what string) {
 // resume, flipping captureLive to match at each edge.
 func TestCaptureLoopClosesAndReopensOnPause(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 
 	first := newFakeSource()
 	var second *fakeSource
@@ -125,7 +125,7 @@ func TestCaptureLoopClosesAndReopensOnPause(t *testing.T) {
 // it would misreport a finite replay as merely "paused."
 func TestCaptureLoopIgnoresPauseWithoutReopen(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	src := newFakeSource()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -156,7 +156,7 @@ func TestCaptureLoopIgnoresPauseWithoutReopen(t *testing.T) {
 // at /api/workers) until the next pause/resume edge retries.
 func TestCaptureLoopReopenFailureLeavesCaptureOff(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	first := newFakeSource()
 
 	reopenErr := errors.New("boom")

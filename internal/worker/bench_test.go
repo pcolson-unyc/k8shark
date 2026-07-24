@@ -15,7 +15,7 @@ import (
 
 func BenchmarkConsumeHTTP(b *testing.B) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40000, 80)
 	const req = "GET /api/v1/users?page=2 HTTP/1.1\r\nHost: api\r\nUser-Agent: bench\r\n\r\n"
 	const resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"
@@ -31,7 +31,7 @@ func BenchmarkConsumeHTTP(b *testing.B) {
 
 func BenchmarkConsumeRedis(b *testing.B) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40001, redisPort)
 	const req = "*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n"
 	const resp = "$5\r\nvalue\r\n"
@@ -47,7 +47,7 @@ func BenchmarkConsumeRedis(b *testing.B) {
 
 func BenchmarkConsumePostgres(b *testing.B) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40002, pgPort)
 	req := string(pgMsg('Q', []byte("SELECT id FROM t WHERE k = 1\x00")))
 	resp := string(pgMsg('C', []byte("SELECT 1\x00")))

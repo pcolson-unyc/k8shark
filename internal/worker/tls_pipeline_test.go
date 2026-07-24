@@ -42,7 +42,7 @@ func (f *fakeTLSSource) Close() error {
 // TLS records reach the same dissector plaintext AF_PACKET traffic uses.
 func TestConsumeTLSPairsDecryptedHTTP(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	src := newFakeTLSSource()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -89,7 +89,7 @@ func TestConsumeTLSPairsDecryptedHTTP(t *testing.T) {
 // produce a paired protocol=postgres entry.
 func TestConsumeTLSDispatchesDecryptedPostgres(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	src := newFakeTLSSource()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -130,7 +130,7 @@ func TestConsumeTLSDispatchesDecryptedPostgres(t *testing.T) {
 // the synthetic pid:<n> endpoint.
 func TestConsumeTLSRealTupleEndpoints(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	src := newFakeTLSSource()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -175,7 +175,7 @@ func TestConsumeTLSRealTupleEndpoints(t *testing.T) {
 // role detection must still produce a correct protocol=postgres entry.
 func TestConsumeTLSServerSidePostgres(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	src := newFakeTLSSource()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -286,7 +286,7 @@ func TestChanPipeCloseUnblocksRead(t *testing.T) {
 // stream rather than resume the truncated one past a hole.
 func TestConsumeTLSLaggedTombstone(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	src := newFakeTLSSource()
 
 	ctx, cancel := context.WithCancel(context.Background())

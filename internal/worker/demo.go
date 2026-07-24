@@ -91,7 +91,7 @@ var kafkaOpsDemo = []struct {
 }
 
 // runDemo emits synthetic entries to the sink at roughly rps until stopped.
-func runDemo(s *sink, node string, rps int, stop <-chan struct{}) {
+func runDemo(s *sink, node, nodeIP string, rps int, stop <-chan struct{}) {
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 	interval := time.Second / time.Duration(max(rps, 1))
 	t := time.NewTicker(interval)
@@ -109,12 +109,12 @@ func runDemo(s *sink, node string, rps int, stop <-chan struct{}) {
 				continue
 			}
 			seq++
-			s.emit(genEntry(rnd, node, seq))
+			s.emit(genEntry(rnd, node, nodeIP, seq))
 		}
 	}
 }
 
-func genEntry(rnd *rand.Rand, node string, seq int64) *api.Entry {
+func genEntry(rnd *rand.Rand, node, nodeIP string, seq int64) *api.Entry {
 	src := demoServices[rnd.Intn(len(demoServices))]
 	dst := demoServices[rnd.Intn(len(demoServices))]
 	for dst.name == src.name {
@@ -129,6 +129,7 @@ func genEntry(rnd *rand.Rand, node string, seq int64) *api.Entry {
 		Timestamp: now,
 		ElapsedMs: elapsed,
 		Node:      node,
+		NodeIP:    nodeIP,
 		Source:    api.Endpoint{IP: src.ip, Port: 30000 + rnd.Intn(20000), Name: src.name, Namespace: src.ns},
 	}
 

@@ -135,7 +135,7 @@ func TestSafeBodyBinaryBecomesHexPreview(t *testing.T) {
 // and readable in the entry, not as opaque compressed bytes.
 func TestConsumeHTTPGzipResponseIsDecompressed(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	rNet, rTr, sNet, sTr := flows(40400, 80)
 
 	want := `{"message":"hello, this is a compressed JSON body"}`

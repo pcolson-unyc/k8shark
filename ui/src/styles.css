@@ -506,3 +506,25 @@ table.kv.rec .kv-k { width: 68px; color: var(--accent); }
 .top-key { font-family: var(--mono, monospace); }
 .top-table td.has-err { color: var(--err); }
 .top-empty { color: var(--text-dim); text-align: center; padding: 24px; }
+
+/* Konami code easter egg: a shark dances its way across the screen. The
+   outer element handles the straight-line crossing; the inner span bounces
+   and wiggles independently so the two transforms don't fight over the same
+   `animation` property. */
+.konami-shark {
+  position: fixed; top: 40%; left: -1.5em; z-index: 40;
+  font-size: 64px; pointer-events: none;
+  animation: konami-swim 3s linear forwards;
+}
+.konami-shark-dance {
+  display: inline-block;
+  animation: konami-dance 0.4s ease-in-out infinite;
+}
+@keyframes konami-swim {
+  0% { transform: translateX(0) scaleX(-1); }
+  100% { transform: translateX(calc(100vw + 3em)) scaleX(-1); }
+}
+@keyframes konami-dance {
+  0%, 100% { transform: translateY(0) rotate(-12deg); }
+  50% { transform: translateY(-16px) rotate(12deg); }
+}

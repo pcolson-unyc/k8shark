@@ -41,9 +41,10 @@ const (
 // agnostic: each dissector enqueues a request and later completes it with a
 // response, and the pipeline pairs them FIFO per connection.
 type pipeline struct {
-	sink *sink
-	node string
-	log  *slog.Logger
+	sink   *sink
+	node   string
+	nodeIP string
+	log    *slog.Logger
 
 	seq atomic.Uint64
 
@@ -89,10 +90,11 @@ type pipeline struct {
 	redactPGParams bool
 }
 
-func newPipeline(s *sink, node string, log *slog.Logger) *pipeline {
+func newPipeline(s *sink, node, nodeIP string, log *slog.Logger) *pipeline {
 	return &pipeline{
 		sink:          s,
 		node:          node,
+		nodeIP:        nodeIP,
 		log:           log,
 		conns:         map[string]*connState{},
 		dns:           map[string]*dnsPending{},
@@ -255,6 +257,7 @@ func (p *pipeline) completeResponse(key string, resp api.Payload, statusCode int
 		Timestamp:   pr.ts,
 		ElapsedMs:   now.Sub(pr.ts).Milliseconds(),
 		Node:        p.node,
+		NodeIP:      p.nodeIP,
 		Source:      pr.src,
 		Destination: pr.dst,
 		Request:     pr.req,
@@ -713,6 +716,7 @@ func (p *pipeline) emitWSFrame(src, dst api.Endpoint, opcode byte, payload []byt
 		Protocol:    api.ProtocolWS,
 		Timestamp:   time.Now(),
 		Node:        p.node,
+		NodeIP:      p.nodeIP,
 		Source:      src,
 		Destination: dst,
 		Request: api.Payload{
@@ -848,6 +852,7 @@ func (p *pipeline) dnsResponse(clientIP string, clientPort int, dns *layers.DNS,
 		Timestamp:   pend.ts,
 		ElapsedMs:   now.Sub(pend.ts).Milliseconds(),
 		Node:        p.node,
+		NodeIP:      p.nodeIP,
 		Source:      pend.src,
 		Destination: pend.dst,
 		Request:     api.Payload{Question: pend.question, Summary: "A? " + pend.question, DNS: reqDetail, Raw: pend.raw},

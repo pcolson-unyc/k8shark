@@ -509,6 +509,7 @@ func (p *pipeline) emitRedisPush(src, dst api.Endpoint, v respVal, proto api.Pro
 		Protocol:    proto,
 		Timestamp:   time.Now(),
 		Node:        p.node,
+		NodeIP:      p.nodeIP,
 		Source:      src,
 		Destination: dst,
 		Request:     api.Payload{Command: kind, Summary: kind},

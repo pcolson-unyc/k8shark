@@ -193,6 +193,7 @@ export interface Entry {
   timestamp: string;
   elapsedMs: number;
   node: string;
+  nodeIp?: string;
   src: Endpoint;
   dst: Endpoint;
   request: Payload;

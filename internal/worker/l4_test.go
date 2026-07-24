@@ -20,7 +20,7 @@ func mkTCP(seq uint32, syn, ack, fin bool, window uint16, payload int, opts ...l
 
 func TestTrackTCPSnapshotL4(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	// client 40000 -> server 80
 	reqNet, reqTr, respNet, respTr := flows(40000, 80)
 
@@ -80,7 +80,7 @@ func TestTrackTCPSnapshotL4(t *testing.T) {
 // A FIN closes the flow and emits a generic L4 entry carrying L4Info.
 func TestTrackTCPCloseEmitsL4(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	reqNet, reqTr, _, _ := flows(41000, 443)
 	base := time.Unix(1_700_000_000, 0)
 	meta := l4meta{srcMAC: "02:00:00:00:00:0a", ipVersion: 4, ttl: 128}
@@ -105,7 +105,7 @@ func TestTrackTCPCloseEmitsL4(t *testing.T) {
 // Postgres/AMQP populated Raw at all.
 func TestTrackTCPCapturesRawPayload(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	reqNet, reqTr, _, _ := flows(41001, 443)
 	base := time.Unix(1_700_000_001, 0)
 
@@ -168,7 +168,7 @@ func TestSegFingerprintSeenRecently(t *testing.T) {
 // bytes/packets and — worse — read as a spurious retransmit.
 func TestTrackTCPDedupsSamePacketAcrossInterfaces(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	reqNet, reqTr, _, _ := flows(43000, 80)
 	base := time.Unix(1_700_000_003, 0)
 
@@ -213,7 +213,7 @@ func TestTrackTCPDedupsSamePacketAcrossInterfaces(t *testing.T) {
 // network problems along with the same-host duplicate deliveries it targets.
 func TestTrackTCPCountsRealRetransmitOutsideDedupWindow(t *testing.T) {
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	reqNet, reqTr, _, _ := flows(43001, 80)
 	base := time.Unix(1_700_000_004, 0)
 
@@ -247,7 +247,7 @@ func TestMaxFlowsCapEvicts(t *testing.T) {
 	defer func() { maxFlows = orig }()
 
 	s := newSink("", "", "n", discardLogger())
-	p := newPipeline(s, "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
 	base := time.Unix(1_700_000_002, 0)
 
 	// 5 distinct connections, each just a SYN (no FIN/RST, so trackTCP itself

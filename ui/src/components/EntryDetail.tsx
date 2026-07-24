@@ -124,7 +124,7 @@ export function EntryDetail({
       <div className="detail-meta">
         <Meta k="status" v={String(entry.statusCode || entry.status || "—")} />
         <Meta k="latency" v={`${entry.elapsedMs} ms`} />
-        <Meta k="node" v={entry.node} />
+        <Meta k="node" v={entry.nodeIp ? `${entry.node} · ${entry.nodeIp}` : entry.node} />
         <Meta k="time" v={new Date(entry.timestamp).toLocaleString([], { hour12: false })} />
       </div>
 
