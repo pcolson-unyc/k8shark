@@ -141,9 +141,23 @@ type TLSInfo struct {
 	Cipher  string `json:"cipher,omitempty"`
 }
 
-// RawView is a bounded hex+ascii dump of one direction's application bytes.
+// RawView is a bounded sample of one direction's application bytes.
+//
+// Data is the sample itself, base64 on the wire (Go marshals []byte that way).
+// Hex is the legacy form: the same bytes pre-rendered as a `hexdump -C`-style
+// text block by the worker. Hex is ~4.94x the size of the bytes it describes
+// (79 characters per 16 bytes) against base64's 1.33x, and rendering it cost
+// the worker more CPU than dissection did, so current workers populate Data and
+// leave Hex empty — the dump is rendered in the browser, from Data, only for
+// the one entry whose detail panel is open.
+//
+// Hex is retained, not removed: a worker older than its hub still sends it, so
+// every consumer must read Data first and fall back to parsing Hex. See
+// pcapPayloadBytes (internal/hub/pcap.go) and payloadBytes (ui/src/pcap.ts) for
+// the two decoders that implement that order.
 type RawView struct {
-	Hex       string `json:"hex,omitempty"`   // formatted "0000  48 54 54 50 ...  HTTP..." block
+	Data      []byte `json:"data,omitempty"`  // captured bytes, base64-encoded on the wire
+	Hex       string `json:"hex,omitempty"`   // legacy pre-rendered "0000  48 54 54 50 ...  HTTP..." block
 	Bytes     int    `json:"bytes,omitempty"` // total bytes seen before truncation
 	Truncated bool   `json:"truncated,omitempty"`
 }
@@ -391,8 +405,21 @@ type Stats struct {
 	// buffer full) since the hub started — a degradation signal beyond the
 	// binary connected/disconnected indicator.
 	BroadcastDropped int64 `json:"broadcastDropped"`
-	// Last1m/Last5m are trailing windows over the in-memory buffer (nil on old
-	// hubs; additive).
+	// Last1m/Last5m are trailing windows over *ingest*, NOT bounded by the
+	// hub's in-memory buffer capacity: they tally every entry the hub observed
+	// in the window, including ones already evicted from the ring. (nil on old
+	// hubs; additive.)
+	//
+	// This changed meaning: hubs before the per-second bucket rewrite computed
+	// these by walking the ring, so both were implicitly capped at buffer
+	// capacity and under-reported whenever the window held more traffic than
+	// the buffer. At capacity 10000 and ~2000 entries/s only ~5s of traffic
+	// fits in the ring, so Last5m.Entries goes from ~10000 (EntriesPerSec ~33)
+	// to ~600000 (EntriesPerSec ~2000) across that upgrade — same field, same
+	// JSON, a genuinely different (and correct) number. Anything trending these
+	// across a hub upgrade will see a step change; that is expected, and the
+	// new value is the real ingest rate rather than a buffer-capacity artefact.
+	// Do not clamp these back to the buffer.
 	Last1m *WindowStats `json:"last1m,omitempty"`
 	Last5m *WindowStats `json:"last5m,omitempty"`
 }

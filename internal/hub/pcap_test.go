@@ -2,11 +2,13 @@ package hub
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,6 +210,108 @@ func TestHandlePcapTimeWindow(t *testing.T) {
 	}
 }
 
+// pcapHexDumpOf renders bytes in the worker hexdump.go "hexdump -C" style, so a
+// test can build a RawView.Hex block that parseHexDump round-trips.
+func pcapHexDumpOf(b []byte) string {
+	var sb strings.Builder
+	for off := 0; off < len(b); off += 16 {
+		end := off + 16
+		if end > len(b) {
+			end = len(b)
+		}
+		line := b[off:end]
+		fmt.Fprintf(&sb, "%08x  ", off)
+		for _, c := range line {
+			fmt.Fprintf(&sb, "%02x ", c)
+		}
+		sb.WriteString(" |")
+		for _, c := range line {
+			if c >= 0x20 && c < 0x7f {
+				sb.WriteByte(c)
+			} else {
+				sb.WriteByte('.')
+			}
+		}
+		sb.WriteString("|\n")
+	}
+	return sb.String()
+}
+
+// The raw hexdump and the body are capped independently, so raw is not always
+// the bigger sample: the export must take whichever direction carries more
+// bytes, and keep raw on a tie (byte-exact capture beats decompressed text).
+func TestPcapPayloadBytesPrefersLongerSource(t *testing.T) {
+	body := "GET /health HTTP/1.1\r\nHost: svc\r\nAccept: */*\r\n\r\n"
+	tests := []struct {
+		name string
+		p    api.Payload
+		want string
+	}{{
+		// The regression: a raw-capture cap lowered below the body cap must not
+		// silently shrink the export down to the truncated raw sample.
+		name: "raw shorter than body -> body",
+		p:    api.Payload{Body: body, Raw: &api.RawView{Hex: pcapHexDumpOf([]byte(body[:8])), Bytes: 8}},
+		want: body,
+	}, {
+		// Generic L4 / DNS entries carry raw bytes and no decoded body at all.
+		name: "raw only -> raw",
+		p:    api.Payload{Raw: &api.RawView{Hex: pcapHexDumpOf([]byte("PING\r\n")), Bytes: 6}},
+		want: "PING\r\n",
+	}, {
+		// Equal lengths: raw wins — it never went through decompression/text
+		// handling, so it's the more faithful of two same-sized views.
+		name: "equal length -> raw",
+		p:    api.Payload{Body: "xxxxxx", Raw: &api.RawView{Hex: pcapHexDumpOf([]byte("PING\r\n")), Bytes: 6}},
+		want: "PING\r\n",
+	}, {
+		name: "neither -> summary",
+		p:    api.Payload{Summary: "A example.com"},
+		want: "A example.com",
+	}, {
+		name: "empty payload -> nothing",
+		p:    api.Payload{},
+		want: "",
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pcapPayloadBytes(&tc.p); string(got) != tc.want {
+				t.Errorf("pcapPayloadBytes = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// End-to-end: the exported frame for an entry whose raw sample is shorter than
+// its body carries the full body bytes, not the truncated raw sample.
+func TestHandlePcapPrefersLongerBodyOverShortRaw(t *testing.T) {
+	s := New(slog.Default(), Options{})
+	body := "GET /health HTTP/1.1\r\nHost: svc\r\n\r\n"
+	s.store.add(&api.Entry{
+		ID:          "short-raw",
+		Protocol:    api.ProtocolHTTP,
+		Timestamp:   time.Now(),
+		Source:      api.Endpoint{IP: "10.2.0.1", Port: 5000},
+		Destination: api.Endpoint{IP: "10.2.0.2", Port: 80},
+		// Raw capped at 8 bytes while the hub still holds the whole body.
+		Request: api.Payload{Body: body, Raw: &api.RawView{Hex: pcapHexDumpOf([]byte(body[:8])), Bytes: 8}},
+	})
+
+	rec := httptest.NewRecorder()
+	s.handlePcap(rec, httptest.NewRequest(http.MethodGet, "/api/pcap", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	pkts := readPcapPackets(t, rec.Body.Bytes())
+	if len(pkts) != 1 {
+		t.Fatalf("packet count = %d, want 1 (request only)", len(pkts))
+	}
+	pkt := gopacket.NewPacket(pkts[0], layers.LayerTypeEthernet, gopacket.Default)
+	app := pkt.ApplicationLayer()
+	if app == nil || !bytes.Equal(app.Payload(), []byte(body)) {
+		t.Errorf("payload = %q, want the full body %q", app, body)
+	}
+}
+
 // parseHexDump handles multi-line blocks and ignores the ascii column even when
 // it contains hex-looking text.
 func TestParseHexDump(t *testing.T) {
@@ -220,4 +324,47 @@ func TestParseHexDump(t *testing.T) {
 	if len(parseHexDump("   \n")) != 0 {
 		t.Error("blank input should decode to no bytes")
 	}
+}
+
+// TestPcapPayloadBytesPrefersDataOverHex covers the RawView wire migration:
+// current workers ship raw bytes in Data, older ones pre-rendered them into
+// Hex, and the hub must read both — Data first, since it is the authoritative
+// form and needs no parsing at all.
+func TestPcapPayloadBytesPrefersDataOverHex(t *testing.T) {
+	want := []byte("GET / HTTP/1.1\r\n\r\n")
+
+	t.Run("data is used directly", func(t *testing.T) {
+		got := pcapPayloadBytes(&api.Payload{Raw: &api.RawView{Data: want, Bytes: len(want)}})
+		if string(got) != string(want) {
+			t.Errorf("payload = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("legacy hex is still decoded when there is no data", func(t *testing.T) {
+		got := pcapPayloadBytes(&api.Payload{Raw: &api.RawView{Hex: pcapHexDumpOf(want), Bytes: len(want)}})
+		if string(got) != string(want) {
+			t.Errorf("payload = %q, want %q — the old-worker fallback is broken", got, want)
+		}
+	})
+
+	t.Run("data wins over hex if a frame somehow carries both", func(t *testing.T) {
+		got := pcapPayloadBytes(&api.Payload{Raw: &api.RawView{
+			Data: want,
+			Hex:  pcapHexDumpOf([]byte("stale stale stale stale stale")), // longer, and wrong
+		}})
+		if string(got) != string(want) {
+			t.Errorf("payload = %q, want the Data bytes %q", got, want)
+		}
+	})
+
+	t.Run("a longer body still beats a short data sample", func(t *testing.T) {
+		body := "GET /health HTTP/1.1\r\nHost: svc\r\nAccept: */*\r\n\r\n"
+		got := pcapPayloadBytes(&api.Payload{
+			Raw:  &api.RawView{Data: []byte("GET /heal"), Bytes: len(body), Truncated: true},
+			Body: body,
+		})
+		if string(got) != body {
+			t.Errorf("payload = %q, want the fuller body %q", got, body)
+		}
+	})
 }

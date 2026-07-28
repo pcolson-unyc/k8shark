@@ -42,7 +42,15 @@ const (
 	// mongoScanBytes bounds how much of a message body we materialize to find
 	// and scan the section-0 command document (which is always the first
 	// section); bulk document sequences past it are discarded, not allocated.
-	mongoScanBytes = 4 << 20
+	//
+	// 64 KiB: the command document is the command name + its options + $db,
+	// i.e. kilobytes, because the drivers put bulk payloads (the documents of
+	// an insert/update/delete) in the kind-1 document sequences that FOLLOW it,
+	// not inside it. The rare command document that does exceed this — a
+	// hand-built inline insert, a huge $in list — is no longer dropped either:
+	// opMsgBodyDoc hands back the materialized prefix, and the command name is
+	// the document's first key, so only trailing fields like $db are lost.
+	mongoScanBytes = 64 << 10
 )
 
 // mongoPending is a request awaiting its reply, keyed by conn+requestID.
@@ -276,8 +284,18 @@ func opMsgBodyDoc(body []byte) []byte {
 				return nil
 			}
 			n := int(int32(binary.LittleEndian.Uint32(b[:4])))
-			if n < 5 || n > len(b) {
+			if n < 5 {
 				return nil
+			}
+			if n > len(b) {
+				// The document runs past what readMongoBody materialized
+				// (mongoScanBytes). Hand back the prefix instead of dropping the
+				// whole message: scanBSON is bounds-checked, and the command name
+				// is the document's FIRST key, so a prefix still identifies the
+				// operation (only trailing fields like $db are missed). Garbled
+				// input takes this path too, but then the prefix yields no
+				// parseable element and the caller drops it anyway.
+				return b
 			}
 			return b[:n]
 		case 1: // document sequence: size(4, incl itself) + identifier + docs

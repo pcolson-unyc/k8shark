@@ -1,10 +1,13 @@
 package hub
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +104,24 @@ func TestHandleEntriesBeforeSeq(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("before_seq=bogus status = %d, want 400", rec.Code)
 	}
+
+	// before_seq=0 parses fine and clamps to nothing, so it reaches the store
+	// as a real cursor. Seq is 1-indexed, so it must page off the start of the
+	// stream and return []. If the store treats 0 as "no cursor" the client
+	// gets the newest full page back instead and its backwards paging loop
+	// wraps to the head and never terminates.
+	rec = httptest.NewRecorder()
+	s.handleEntries(rec, httptest.NewRequest(http.MethodGet, "/api/entries?before_seq=0", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("before_seq=0 status = %d, want 200", rec.Code)
+	}
+	got = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decoding entries: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("before_seq=0 = %+v, want [] (past the start of the stream)", got)
+	}
 }
 
 // ?sort=&order= returns the top-N entries by numeric field value, and
@@ -141,6 +162,164 @@ func TestHandleEntriesSort(t *testing.T) {
 	s.handleEntries(rec, httptest.NewRequest(http.MethodGet, "/api/entries?sort=elapsedMs&order=sideways", nil))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("bad order status = %d, want 400", rec.Code)
+	}
+}
+
+// /api/entries splices the store's cached per-entry JSON into the response
+// array instead of re-marshaling the structs (writeJSONArray). That is a
+// rewritten renderer whose output must stay byte-identical to the old
+// json.Encoder path — including the trailing newline and the HTML escaping of
+// characters like & and < inside paths — or clients see a silently different
+// wire shape. Every page variant is compared against what writeJSON would
+// have produced for the equivalent []*api.Entry.
+func TestHandleEntriesRawJSONMatchesStructs(t *testing.T) {
+	s := New(slog.Default(), Options{})
+	base := time.Unix(1_700_000_000, 0)
+	for i := 0; i < 5; i++ {
+		proto := api.ProtocolHTTP
+		if i%2 == 1 {
+			proto = api.ProtocolRedis
+		}
+		s.store.add(&api.Entry{
+			ID:        fmt.Sprintf("e%d", i),
+			Protocol:  proto,
+			Timestamp: base.Add(time.Duration(i) * time.Second),
+			Status:    "success",
+			// & and < exercise the encoder's HTML escaping, which the cached
+			// bytes must reproduce exactly.
+			Request:  api.Payload{Method: "GET", Path: fmt.Sprintf("/a?x=%d&y=<%d>", i, i)},
+			Response: api.Payload{StatusCode: 200},
+		})
+	}
+
+	httpOnly, err := CompileFilter(`protocol == "http"`)
+	if err != nil {
+		t.Fatalf("compiling filter: %v", err)
+	}
+
+	cases := []struct {
+		name  string
+		query string
+		want  []*api.Entry
+	}{
+		{"all", "", s.store.recent(200, nil)},
+		{"limit", "?limit=2", s.store.recent(2, nil)},
+		{"filter", `?filter=protocol+%3D%3D+%22http%22`, s.store.recent(200, httpOnly)},
+		{"before", "?before=e3", s.store.recentBefore("e3", 200, nil)},
+		{"before_seq", "?before_seq=3", s.store.recentBeforeSeq(3, 200, nil)},
+		{"empty", "?before=nope", s.store.recentBefore("nope", 200, nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			s.handleEntries(rec, httptest.NewRequest(http.MethodGet, "/api/entries"+tc.query, nil))
+
+			var want bytes.Buffer
+			if err := json.NewEncoder(&want).Encode(tc.want); err != nil {
+				t.Fatalf("encoding expectation: %v", err)
+			}
+			if rec.Body.String() != want.String() {
+				t.Errorf("cached-JSON response differs from the struct-marshaled one\n got: %s\nwant: %s",
+					rec.Body.String(), want.String())
+			}
+			if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("content-type = %q, want application/json", ct)
+			}
+		})
+	}
+}
+
+// flushBroadcast groups clients by filter and assembles one frame per group.
+// A mis-grouping would silently deliver another client's filtered feed, so
+// both the per-group content and the sharing itself are asserted.
+func TestFlushBroadcastGroupsByFilter(t *testing.T) {
+	s := New(discardLogger(), Options{})
+	const httpFilter = `protocol == "http"`
+	const redisFilter = `protocol == "redis"`
+
+	register := func(filter string) *frontClient {
+		pred, err := CompileFilter(filter)
+		if err != nil {
+			t.Fatalf("compiling %q: %v", filter, err)
+		}
+		c := &frontClient{send: make(chan []byte, 8), pred: pred, filterKey: filterKeySource(filter)}
+		s.mu.Lock()
+		s.frontClients[c] = struct{}{}
+		s.frontCount.Store(int32(len(s.frontClients)))
+		s.mu.Unlock()
+		return c
+	}
+	a, b := register(httpFilter), register(httpFilter)
+	r := register(redisFilter)
+
+	h := &api.Entry{ID: "h1", Protocol: api.ProtocolHTTP, Timestamp: time.Now()}
+	d := &api.Entry{ID: "r1", Protocol: api.ProtocolRedis, Timestamp: time.Now()}
+	s.broadcast(h, s.store.add(h))
+	s.broadcast(d, s.store.add(d))
+	s.flushBroadcast()
+
+	frame := func(c *frontClient, who string) []byte {
+		select {
+		case got := <-c.send:
+			return got
+		default:
+			t.Fatalf("%s received no frame", who)
+			return nil
+		}
+	}
+	fa, fb, fr := frame(a, "client a"), frame(b, "client b"), frame(r, "redis client")
+
+	if !bytes.Equal(fa, fb) {
+		t.Errorf("same-filter clients got different frames:\n%s\n%s", fa, fb)
+	}
+	// Same-filter clients must get the *same* buffer, not merely equal ones —
+	// that shared assembly is the point of the grouping.
+	if reflect.ValueOf(fa).Pointer() != reflect.ValueOf(fb).Pointer() {
+		t.Error("same-filter clients got separately assembled frames; the batch is not being shared")
+	}
+	if !strings.Contains(string(fa), `"h1"`) || strings.Contains(string(fa), `"r1"`) {
+		t.Errorf("http client frame = %s, want just h1", fa)
+	}
+	if !strings.Contains(string(fr), `"r1"`) || strings.Contains(string(fr), `"h1"`) {
+		t.Errorf("redis client frame = %s, want just r1", fr)
+	}
+	if reflect.ValueOf(fr).Pointer() == reflect.ValueOf(fa).Pointer() {
+		t.Error("clients with different filters must not share a frame")
+	}
+}
+
+// The per-client send queue is bounded by bytes as well as by slot count, so
+// one stalled tab can't pin hundreds of megabytes of batch frames.
+func TestTrySendByteBudget(t *testing.T) {
+	c := &frontClient{send: make(chan []byte, 256)}
+	const frameSize = 1 << 20
+	frame := make([]byte, frameSize)
+
+	admitted := 0
+	for i := 0; i < 32; i++ {
+		if c.trySend(frame) {
+			admitted++
+		}
+	}
+	if want := frontQueueBytes / frameSize; admitted != want {
+		t.Errorf("admitted %d frames of %d bytes, want %d (an %d-byte budget)", admitted, frameSize, want, frontQueueBytes)
+	}
+
+	// Draining one frame (as frontWriter does) frees its share of the budget.
+	<-c.send
+	c.queuedBytes.Add(-frameSize)
+	if !c.trySend(frame) {
+		t.Error("a frame was refused after the queue drained below the budget")
+	}
+
+	// A single frame bigger than the whole budget is still admitted into an
+	// empty queue, so an outsized batch can't permanently starve a client.
+	big := &frontClient{send: make(chan []byte, 4)}
+	if !big.trySend(make([]byte, frontQueueBytes+1)) {
+		t.Error("an oversized frame was refused by an empty queue; the client would never catch up")
+	}
+	if big.trySend([]byte("x")) {
+		t.Error("a second frame was admitted while the queue was already over budget")
 	}
 }
 

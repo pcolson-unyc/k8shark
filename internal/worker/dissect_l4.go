@@ -3,6 +3,7 @@ package worker
 import (
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -25,6 +26,16 @@ type flowState struct {
 	rstSeen   bool
 	l7        bool // dissected by an L7 parser -> never emit a generic flow
 	emitted   bool // already emitted on close -> don't re-emit
+
+	// clientNetEP/clientTrEP are the gopacket endpoints of the client side of
+	// the flow, recorded when the orientation is decided (newFlow). trackTCP's
+	// per-packet "is this client->server?" test compares against these — a pair
+	// of comparable fixed-size structs — instead of rebuilding the IP string
+	// and re-parsing the port out of a string on every single packet.
+	// f.src/f.dst keep the rendered string/int form regardless: buildL4Info and
+	// emitFlow ship those over the wire.
+	clientNetEP gopacket.Endpoint
+	clientTrEP  gopacket.Endpoint
 
 	// L3 header (copied once from the first packet's l4meta)
 	srcMAC, dstMAC string
@@ -96,15 +107,18 @@ func (fp *segFingerprint) seenRecently(seq uint32, length int, ts time.Time) boo
 	return false
 }
 
-// rawView renders the flow's sampled payload as a RawView, or nil if none
+// rawView snapshots the flow's sampled payload as a RawView, or nil if none
 // was captured (raw capture disabled, or a flow with no payload bytes, e.g.
 // a bare SYN/FIN handshake).
+//
+// The bytes are copied because f.rawBuf keeps being appended to for the life of
+// the flow, while the emitted entry is marshaled later on the sink goroutine.
 func (f *flowState) rawView() *api.RawView {
 	if len(f.rawBuf) == 0 {
 		return nil
 	}
 	return &api.RawView{
-		Hex:       hexDump(f.rawBuf, len(f.rawBuf)),
+		Data:      append([]byte(nil), f.rawBuf...),
 		Bytes:     f.rawTotal,
 		Truncated: f.rawTotal > len(f.rawBuf),
 	}
@@ -147,14 +161,21 @@ func newFlow(proto api.Protocol, netFlow, transport gopacket.Flow, ts time.Time)
 	sp := portOf(transport.Src().String())
 	dp := portOf(transport.Dst().String())
 	var src, dst api.Endpoint
+	var cliNet, cliTr gopacket.Endpoint
 	if sp >= dp {
 		src = api.Endpoint{IP: netFlow.Src().String(), Port: sp}
 		dst = api.Endpoint{IP: netFlow.Dst().String(), Port: dp}
+		cliNet, cliTr = netFlow.Src(), transport.Src()
 	} else {
 		src = api.Endpoint{IP: netFlow.Dst().String(), Port: dp}
 		dst = api.Endpoint{IP: netFlow.Src().String(), Port: sp}
+		cliNet, cliTr = netFlow.Dst(), transport.Dst()
 	}
-	return &flowState{proto: proto, src: src, dst: dst, firstSeen: ts, lastSeen: ts}
+	return &flowState{
+		proto: proto, src: src, dst: dst,
+		clientNetEP: cliNet, clientTrEP: cliTr,
+		firstSeen: ts, lastSeen: ts,
+	}
 }
 
 // maxFlows bounds p.flows so a burst of new connections — a SYN flood, a
@@ -166,22 +187,30 @@ func newFlow(proto api.Protocol, netFlow, transport gopacket.Flow, ts time.Time)
 // never assigns to it.
 var maxFlows = 100000
 
-// evictOverCapLocked drops one flow if p.flows is over maxFlows. It picks
-// whichever key a single map iteration step yields rather than scanning for
-// the actual oldest entry: a full scan would itself cost O(len(p.flows)) per
-// insert once at cap, which is exactly the kind of unbounded CPU work a
-// flood should not be able to trigger. flushFlows already reaps idle flows
-// properly (by lastSeen) every 15s; this cap only matters for the burst
-// between those cycles. Callers must hold flowMu.
+// evictOverCapLocked drops one entry if m is over cap, bumping counter (when
+// non-nil) for each eviction. It picks whichever key a single map iteration
+// step yields rather than scanning for the actual oldest entry: a full scan
+// would itself cost O(len(m)) per insert once at cap, which is exactly the
+// kind of unbounded CPU work a flood should not be able to trigger. The
+// periodic sweeps (flushFlows for p.flows, gc for the pairing maps) already
+// reap stale entries properly, by timestamp, every 15s; this cap only matters
+// for the burst between those cycles. Callers must hold the mutex guarding m.
+func evictOverCapLocked[V any](m map[string]V, cap int, counter *atomic.Uint64) {
+	if len(m) <= cap {
+		return
+	}
+	for k := range m {
+		delete(m, k)
+		if counter != nil {
+			counter.Add(1)
+		}
+		return
+	}
+}
+
+// evictOverCapLocked applies the cap above to p.flows. Callers must hold flowMu.
 func (p *pipeline) evictOverCapLocked() {
-	if len(p.flows) <= maxFlows {
-		return
-	}
-	for k := range p.flows {
-		delete(p.flows, k)
-		p.sink.flowsEvicted.Add(1)
-		return
-	}
+	evictOverCapLocked(p.flows, maxFlows, &p.sink.flowsEvicted)
 }
 
 // markL7 flags a connection as L7-dissected so trackTCP won't emit a duplicate
@@ -213,11 +242,16 @@ func (p *pipeline) trackTCP(netFlow, transport gopacket.Flow, tcp *layers.TCP, l
 		// Was created by markL7 before any packet; fill in orientation.
 		nf := newFlow(api.ProtocolTCP, netFlow, transport, ts)
 		f.src, f.dst, f.firstSeen = nf.src, nf.dst, ts
+		f.clientNetEP, f.clientTrEP = nf.clientNetEP, nf.clientTrEP
 	}
 
-	// Per-direction accounting. f.src is oriented client->server by newFlow, so
-	// a packet whose (netFlow.Src, transport.Src) equals f.src is client->server.
-	clientToServer := netFlow.Src().String() == f.src.IP && portOf(transport.Src().String()) == f.src.Port
+	// Per-direction accounting. The flow is oriented client->server by newFlow,
+	// so a packet whose (netFlow.Src, transport.Src) equals the recorded client
+	// endpoints is client->server. gopacket.Endpoint is a comparable value
+	// (type + length + a fixed-size zero-padded byte array), so == is an exact
+	// match on the same bytes newFlow rendered f.src from — same answer as the
+	// old string/port comparison, without formatting anything.
+	clientToServer := netFlow.Src() == f.clientNetEP && transport.Src() == f.clientTrEP
 	payloadLen := len(tcp.Payload)
 
 	// CAP-8 dedup gate: a payload-bearing packet already seen on this
@@ -249,14 +283,21 @@ func (p *pipeline) trackTCP(netFlow, transport gopacket.Flow, tcp *layers.TCP, l
 	f.captureRaw(tcp.Payload, p.rawCap)
 
 	// Copy the L3 header fields once (from whichever direction is seen first).
-	if f.srcMAC == "" && meta.srcMAC != "" {
-		f.srcMAC, f.dstMAC = meta.srcMAC, meta.dstMAC
+	// Rendering happens here, inside the "not filled in yet" guards and after
+	// the CAP-8 dedup early-return above, rather than eagerly in extractL4Meta:
+	// the MAC strings, the fragment flags and above all the header hexdump are
+	// per-flow values, so paying for them per packet was pure waste. headerHex
+	// is *not* dead for L7-dissected flows — snapshotL4 -> buildL4Info ships it
+	// with every paired entry — so it still has to be computed exactly once per
+	// flow, which is what this branch does.
+	if f.srcMAC == "" && meta.eth != nil {
+		f.srcMAC, f.dstMAC = meta.macStrings()
 	}
 	if f.ipVersion == 0 && meta.ipVersion != 0 {
-		f.ipVersion, f.ttl, f.ipFlags = meta.ipVersion, meta.ttl, meta.ipFlags
+		f.ipVersion, f.ttl, f.ipFlags = meta.ipVersion, meta.ttl, meta.ipFlagStr()
 	}
-	if f.headerHex == "" && meta.headerHex != "" {
-		f.headerHex = meta.headerHex
+	if f.headerHex == "" {
+		f.headerHex = meta.renderHeaderHex(p.headerHexCap)
 	}
 
 	if clientToServer {
@@ -418,24 +459,59 @@ func (p *pipeline) emitICMPEntry(netFlow gopacket.Flow, payload []byte, length i
 }
 
 // flushFlows emits flows idle longer than the timeout and reaps closed/L7 ones.
+//
+// The scan and the deletions are separated so flowMu — the lock trackTCP takes
+// for every single captured packet — is never held across the whole map. At
+// maxFlows that map holds 100 000 entries, and scanning *and* deleting them all
+// under one acquisition stalls capture long enough to back tcpassembly up. The
+// scan itself still needs the lock (iterating a map while another goroutine
+// writes it is a fatal error), but the deletions are batched, releasing flowMu
+// between batches. See gcDeleteBatch.
 func (p *pipeline) flushFlows(idle time.Duration) {
 	now := time.Now()
 	var toEmit []*flowState
+	var stale []string
+
 	p.flowMu.Lock()
 	for k, f := range p.flows {
 		if f.emitted {
-			delete(p.flows, k)
+			stale = append(stale, k)
 			continue
 		}
 		if now.Sub(f.lastSeen) > idle {
 			if !f.l7 && !f.firstSeen.IsZero() {
 				cp := *f
 				toEmit = append(toEmit, &cp)
+				// Mark it emitted *now*, while we still hold the lock and while
+				// the copy is being taken. Between here and the delete pass
+				// below the flow could receive a packet and stop looking idle;
+				// without this flag the delete pass would (correctly) leave it
+				// alone, and it would later be emitted a second time on close.
+				f.emitted = true
 			}
-			delete(p.flows, k)
+			stale = append(stale, k)
 		}
 	}
 	p.flowMu.Unlock()
+
+	for i := 0; i < len(stale); i += gcDeleteBatch {
+		end := i + gcDeleteBatch
+		if end > len(stale) {
+			end = len(stale)
+		}
+		p.flowMu.Lock()
+		for _, k := range stale[i:end] {
+			// Re-check under the lock: flowMu was released between batches, so
+			// a flow may have been refreshed by a new packet (or the key reused
+			// by a brand-new connection) and must not be reaped. Anything
+			// already flagged emitted is unconditionally reapable.
+			if f := p.flows[k]; f != nil && (f.emitted || now.Sub(f.lastSeen) > idle) {
+				delete(p.flows, k)
+			}
+		}
+		p.flowMu.Unlock()
+	}
+
 	for _, f := range toEmit {
 		p.emitFlow(f, "idle")
 	}

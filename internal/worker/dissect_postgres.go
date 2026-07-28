@@ -258,9 +258,15 @@ func skipLeadingUntyped(br *bufio.Reader) error {
 	}
 }
 
+// pgQueryPayload builds the request payload for one Query/Execute. The query
+// text is capped at queryCap (caps.go) BEFORE it is retained or whitespace-
+// collapsed: readPGMessage materializes up to pgMaxPayload (4 MiB) of a
+// Query/Parse message, and without this cap all of it would stay alive in the
+// hub's ring buffer — and be walked again by collapseWS — for a statement whose
+// interesting part is its first line.
 func pgQueryPayload(q string, raw *api.RawView) api.Payload {
-	q = strings.TrimSpace(q)
-	return api.Payload{Query: q, Summary: truncate(collapseWS(q), 160), Raw: raw}
+	q, truncated := capQuery(strings.TrimSpace(q))
+	return api.Payload{Query: q, Summary: truncate(collapseWS(q), 160), Raw: raw, Truncated: truncated}
 }
 
 // pgMaxBindParams caps how many bind parameters we parse from one Bind message,

@@ -1,4 +1,5 @@
 import type { Entry, Payload } from "./types";
+import { rawBytes } from "./rawView";
 
 // pcap.ts synthesizes a classic libpcap (.pcap) file from entries already
 // loaded client-side — same "export what's on screen" spirit as export.ts's
@@ -7,10 +8,11 @@ import type { Entry, Payload } from "./types";
 // request/response becomes one *synthesized* Ethernet+IPv4+TCP/UDP/ICMP
 // packet: real src/dst IP:port and, when available, real L4Info (MACs, TTL,
 // TCP seq/ack/window/flags), but reconstructed headers, not a wire capture.
-// Payload bytes are recovered from RawView.hex (the hexdump -C-style block
-// worker-side hexdump.go emits) when present, falling back to the decoded
-// body/summary text. IPv6 entries are skipped (not emitted) rather than
-// writing a malformed IPv4 packet — see ipv4Bytes.
+// Payload bytes are recovered from the entry's RawView when present (see
+// rawView.ts, which handles both the current base64 form and the legacy
+// pre-rendered hexdump), falling back to the decoded body/summary text. IPv6
+// entries are skipped (not emitted) rather than writing a malformed IPv4
+// packet — see ipv4Bytes.
 
 const LINKTYPE_ETHERNET = 1;
 const ETHERTYPE_IPV4 = 0x0800;
@@ -69,36 +71,29 @@ function ipv4Bytes(ip: string): Uint8Array | null {
   return new Uint8Array(parts);
 }
 
-// parseHexDump reverses hexdump.go's "hexdump -C"-style block back into raw
-// bytes: each line is "<8-hex offset>  <hex bytes, space-separated, an extra
-// space after the 8th>  |<ascii>|". Splitting on " |" isolates the hex
-// portion so ascii-column text that happens to look like hex pairs (e.g. the
-// letters "ab") is never mistaken for a byte.
-function parseHexDump(dump: string): Uint8Array {
-  const bytes: number[] = [];
-  for (const line of dump.split("\n")) {
-    if (!line.trim()) continue;
-    const barIdx = line.indexOf(" |");
-    const hexPart = (barIdx >= 0 ? line.slice(0, barIdx) : line).replace(/^[0-9a-f]{8}\s+/, "");
-    const tokens = hexPart.match(/[0-9a-f]{2}/g);
-    if (!tokens) continue;
-    for (const t of tokens) bytes.push(parseInt(t, 16));
-  }
-  return new Uint8Array(bytes);
-}
-
-// payloadBytes recovers real captured bytes from RawView.hex when present
-// (the common case: worker's raw capture covers HTTP/Redis/Postgres/AMQP/
-// DNS/generic L4 alike), falling back to the decoded body/summary text so an
-// entry without raw capture still contributes readable content to the pcap.
+// payloadBytes recovers real captured bytes from the RawView (the common
+// case: the worker's raw capture covers HTTP/Redis/Postgres/AMQP/DNS/generic
+// L4 alike) or the decoded body, whichever carries more bytes, falling back to
+// the summary text so an entry with neither still contributes readable content
+// to the pcap.
+//
+// Raw and body are capped independently worker-side, so raw can be a much
+// SHORTER sample of the same exchange than the body — preferring raw
+// unconditionally would let a lowered raw-capture cap silently degrade the
+// export. Ties go to raw: it is the byte-exact capture, whereas the body has
+// been through decompression/text handling and isn't byte-exact for binary
+// protocols, so at equal length raw is the more faithful source. Only lengths
+// are compared — the two views are never merged, since they don't necessarily
+// cover the same bytes. Mirrors hub pcapPayloadBytes.
 function payloadBytes(p: Payload | undefined): Uint8Array {
   if (!p) return new Uint8Array(0);
-  if (p.raw?.hex) {
-    const parsed = parseHexDump(p.raw.hex);
-    if (parsed.length > 0) return parsed;
-  }
-  const text = p.body || p.summary || "";
-  return text ? new TextEncoder().encode(text) : new Uint8Array(0);
+  const raw = rawBytes(p.raw);
+  // Encode first: the comparison must be byte-vs-byte, since a UTF-8 body is
+  // longer in bytes than in JS string units.
+  const body = p.body ? new TextEncoder().encode(p.body) : new Uint8Array(0);
+  if (raw.length > 0 && raw.length >= body.length) return raw;
+  if (body.length > 0) return body;
+  return p.summary ? new TextEncoder().encode(p.summary) : new Uint8Array(0);
 }
 
 // --- header builders ---------------------------------------------------
@@ -208,11 +203,17 @@ const FALLBACK_MAC_B = new Uint8Array([0x02, 0, 0, 0, 0, 0x02]);
 
 // buildFrame assembles one Ethernet+IPv4+L4 frame for a single direction
 // (client->server or server->client) of an entry's exchange.
+// reqLen is the request direction's payload length, which the response frame
+// needs for its ack. It is passed in rather than recomputed: the caller already
+// decoded the request payload, and re-deriving it here would re-run the base64
+// decode (and, for a legacy entry, the whole hexdump parse) once per response
+// frame in the export.
 function buildFrame(
   entry: Entry,
   direction: "req" | "resp",
   payload: Uint8Array,
-  packetId: number
+  packetId: number,
+  reqLen: number
 ): Uint8Array | null {
   const forward = direction === "req";
   const fromIP = ipv4Bytes(forward ? entry.src.ip : entry.dst.ip);
@@ -235,7 +236,7 @@ function buildFrame(
     // request's payload length. Real per-direction seq/ack tracking isn't
     // available per-entry, so this is an approximation, not a real capture.
     const seq = forward ? seqBase : ackBase;
-    const ack = forward ? ackBase : seqBase + payloadBytes(entry.request).length;
+    const ack = forward ? ackBase : seqBase + reqLen;
     l4Segment = tcpSegment(fromIP, toIP, fromPort, toPort, seq, ack, entry.l4?.window ?? 64240, payload);
   } else if (protocol === PROTO_UDP) {
     l4Segment = udpSegment(fromIP, toIP, fromPort, toPort, payload);
@@ -281,7 +282,7 @@ export function entriesToPcap(entries: Entry[]): Uint8Array {
 
     const reqBytes = payloadBytes(entry.request);
     if (reqBytes.length > 0 || entry.protocol === "icmp") {
-      const frame = buildFrame(entry, "req", reqBytes, ++packetId);
+      const frame = buildFrame(entry, "req", reqBytes, ++packetId, reqBytes.length);
       if (frame) {
         const tsSec = Math.floor(baseMs / 1000);
         const tsUsec = (baseMs % 1000) * 1000;
@@ -291,7 +292,7 @@ export function entriesToPcap(entries: Entry[]): Uint8Array {
 
     const respBytes = payloadBytes(entry.response);
     if (respBytes.length > 0) {
-      const frame = buildFrame(entry, "resp", respBytes, ++packetId);
+      const frame = buildFrame(entry, "resp", respBytes, ++packetId, reqBytes.length);
       if (frame) {
         const respMs = baseMs + Math.max(entry.elapsedMs, 0);
         const tsSec = Math.floor(respMs / 1000);

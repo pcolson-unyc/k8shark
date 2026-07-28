@@ -2,7 +2,21 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TrafficTable } from "./TrafficTable";
+import { PROTO_COLORS } from "../constants";
 import type { Entry } from "../types";
+
+// jsdom implements no table layout at all, so the column-sizing invariant the
+// traffic table depends on can only be checked against the stylesheet text —
+// read off disk, because vitest stubs CSS imports out (`test.css` defaults to
+// false, so even `?raw` comes back empty). The module specifier is a variable
+// and `import.meta.dirname` is cast because @types/node isn't a dependency
+// here; both stay resolvable for `tsc -b`, which type-checks the tests too.
+const fsModule = "node:fs";
+const { readFileSync } = await import(/* @vite-ignore */ fsModule);
+const styles: string = readFileSync(
+  `${(import.meta as ImportMeta & { dirname: string }).dirname}/../styles.css`,
+  "utf8"
+);
 
 function entry(overrides: Partial<Entry> & { id: string }): Entry {
   return {
@@ -458,6 +472,110 @@ describe("TrafficTable", () => {
       // Normal live behavior resumes for whatever streams in next.
       rerender(<TrafficTable {...baseProps} entries={[entry({ id: "fresh" })]} />);
       expect(summaries()).toEqual(["GET /"]);
+    });
+  });
+
+  // cellContent's per-cell allocations (the protocol badge's style object, the
+  // timestamp formatter) were hoisted to module scope for the live-stream hot
+  // path. Both are pure rendering, so a regression there would be silent —
+  // these pin the rendered output byte-for-byte.
+  describe("cell rendering after hoisting the per-cell allocations", () => {
+    it("formats the time column exactly as toLocaleTimeString did", () => {
+      const ts = "2026-01-01T13:45:07.089Z";
+      // The shared Intl.DateTimeFormat must resolve to the same options
+      // toLocaleTimeString([], { hour12: false }) defaults to, in whatever
+      // locale/timezone the test happens to run in.
+      const expected = new Date(ts).toLocaleTimeString([], { hour12: false }) + ".089";
+      render(<TrafficTable {...baseProps} entries={[entry({ id: "a", timestamp: ts })]} />);
+      expect(screen.getByText(expected)).toBeInTheDocument();
+    });
+
+    it("pads sub-second precision to three digits", () => {
+      const ts = "2026-01-01T13:45:07.007Z";
+      const expected = new Date(ts).toLocaleTimeString([], { hour12: false }) + ".007";
+      render(<TrafficTable {...baseProps} entries={[entry({ id: "a", timestamp: ts })]} />);
+      expect(screen.getByText(expected)).toBeInTheDocument();
+    });
+
+    // Regression: the hoisted Intl.DateTimeFormat throws a RangeError on an
+    // Invalid Date where toLocaleTimeString returned "Invalid Date". With no
+    // error boundary above the table, one unparseable timestamp in the row
+    // window took the entire app down.
+    it("renders a row with an unparseable timestamp instead of throwing", () => {
+      const entries = [
+        entry({ id: "junk", timestamp: "not-a-timestamp", request: { summary: "GET /junk" } }),
+        entry({ id: "ok", request: { summary: "GET /ok" } }),
+      ];
+      render(<TrafficTable {...baseProps} entries={entries} />);
+
+      expect(screen.getByText("GET /junk")).toBeInTheDocument();
+      expect(screen.getByText("GET /ok")).toBeInTheDocument();
+      // The raw string is shown rather than a formatted time.
+      expect(screen.getByText("not-a-timestamp")).toBeInTheDocument();
+    });
+
+    it("colours each protocol badge, falling back to neutral for an unknown protocol", () => {
+      const entries = [
+        entry({ id: "a", protocol: "redis" }),
+        // A protocol a newer worker might emit but this front doesn't know a
+        // colour for — the only way to reach the fallback style.
+        entry({ id: "b", protocol: "quic" as Entry["protocol"] }),
+      ];
+      render(<TrafficTable {...baseProps} entries={entries} />);
+      expect(screen.getByText("redis")).toHaveStyle({ background: PROTO_COLORS.redis });
+      expect(screen.getByText("quic")).toHaveStyle({ background: "#888" });
+    });
+  });
+
+  // table.traffic uses table-layout: fixed so the virtualizer's row swaps can't
+  // trigger a column re-measure mid-scroll. The cost is that a specified column
+  // width becomes a FLOOR (CSS 2.1 §17.5.2.1: used table width is max(width,
+  // sum of column widths)) — pin every column in px and the table stops fitting
+  // narrow viewports and scrolls .table-wrap sideways instead, taking the
+  // sticky thead with it. jsdom can't lay a table out, so these assert the rule
+  // text.
+  describe("fixed table layout column widths (stylesheet invariant)", () => {
+    // Selector list + declaration body of every rule in styles.css, comments
+    // stripped (they talk about widths too).
+    const rules = Array.from(
+      styles.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g),
+      (m) => ({ selector: m[1].trim(), body: m[2] })
+    );
+    const declares = (body: string, prop: string) => new RegExp(`(^|;)\\s*${prop}\\s*:`).test(body);
+
+    it("keeps table-layout: fixed on the traffic table", () => {
+      const table = rules.find((r) => r.selector === "table.traffic");
+      expect(table?.body).toMatch(/table-layout:\s*fixed/);
+    });
+
+    // summary/src/dst/node hold variable-length text and are what has to give
+    // when the viewport (or the 440px detail panel) squeezes the table.
+    it.each([".col-summary", ".col-src", ".col-dst", ".col-node"])(
+      "leaves %s at width:auto so fixed layout can shrink it",
+      (cls) => {
+        const offenders = rules
+          .filter((r) => r.selector.includes(cls))
+          .filter((r) => declares(r.body, "width") || declares(r.body, "min-width"));
+        expect(offenders).toEqual([]);
+      }
+    );
+
+    it("keeps the default column set's floor narrow enough to fit a phone", () => {
+      // class -> pinned px width, from the last rule that declares one.
+      const widths = new Map<string, number>();
+      for (const r of rules) {
+        const px = /(?:^|;)\s*width\s*:\s*(\d+)px/.exec(r.body);
+        if (!px) continue;
+        for (const sel of r.selector.split(",")) {
+          const cls = sel.trim();
+          if (/^\.col-[a-z]+$/.test(cls)) widths.set(cls, Number(px[1]));
+        }
+      }
+      // DEFAULT_VISIBLE plus the always-present pin column. Their px widths are
+      // the table's hard minimum; everything else must come out of what's left.
+      const floor = [".col-pin", ".col-proto", ".col-status", ".col-summary", ".col-src", ".col-dst", ".col-lat", ".col-time"]
+        .reduce((sum, cls) => sum + (widths.get(cls) ?? 0), 0);
+      expect(floor).toBeLessThan(375);
     });
   });
 

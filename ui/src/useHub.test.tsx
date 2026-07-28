@@ -17,7 +17,7 @@
 import { act } from "react-dom/test-utils";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useHub, type HubState } from "./useHub";
+import { flushUpdater, useHub, type HubState } from "./useHub";
 import type { Entry, Envelope } from "./types";
 
 class FakeWebSocket {
@@ -228,5 +228,39 @@ describe("useHub background-tab flush", () => {
       rafCallbacks[0](0);
     });
     expect(latest?.entries.map((e) => e.id)).toEqual(["e1"]);
+  });
+});
+
+// Regression coverage for the flush updater's purity. The buffered batch used
+// to be reversed *inside* the setEntries updater (`buf.reverse().concat(prev)`),
+// which mutates buf in place. React treats an updater as a pure function of
+// `prev` and is free to invoke it more than once for a single update — which is
+// exactly what <StrictMode> (main.tsx wraps the whole app in it) does in
+// development — so the second invocation un-reversed the batch and committed a
+// whole frame's worth of entries oldest-first.
+//
+// Driven against flushUpdater directly rather than through <StrictMode>: which
+// updates React chooses to replay is a version- and scheduling-dependent
+// implementation detail, so a StrictMode render is not a test that reliably
+// fails when the mutation comes back. Calling the updater twice is.
+describe("useHub flush updater", () => {
+  it("yields the same newest-first order however many times it is invoked", () => {
+    // flush() hands the updater a batch that is already newest-first.
+    const batch = [fakeEntry("s3"), fakeEntry("s2"), fakeEntry("s1")];
+    const update = flushUpdater(batch, 100);
+
+    const first = update([]);
+    const second = update([]);
+
+    expect(first.map((e) => e.id)).toEqual(["s3", "s2", "s1"]);
+    expect(second.map((e) => e.id)).toEqual(["s3", "s2", "s1"]);
+    // ...and the batch itself is untouched, so a third caller sees it intact.
+    expect(batch.map((e) => e.id)).toEqual(["s3", "s2", "s1"]);
+  });
+
+  it("prepends to the existing buffer and trims to the cap, newest kept", () => {
+    const update = flushUpdater([fakeEntry("new2"), fakeEntry("new1")], 3);
+    const next = update([fakeEntry("old1"), fakeEntry("old2"), fakeEntry("old3")]);
+    expect(next.map((e) => e.id)).toEqual(["new2", "new1", "old1"]);
   });
 });

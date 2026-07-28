@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Entry, Endpoint } from "../types";
 import { endpointClause } from "../iflClause";
 
@@ -33,6 +33,17 @@ const WINDOW_OPTIONS = [200, 500, 800, 1500, 3000] as const;
 const VB_DEFAULT = { x: 0, y: 0, w: 960, h: 640 };
 const NODE_R = 22;
 
+// How often the graph is re-aggregated from the live buffer. The map is a
+// rolling aggregate over the last 200–3000 entries: at live rates its shape
+// cannot change meaningfully between animation frames, but `entries` gets a
+// brand-new identity on every rAF flush from useHub. Keying the graph memo on
+// that array re-walked the whole window and reconciled every SVG element 60
+// times a second (~48k entry-iterations/s at the 800-entry default) — enough
+// to peg a core with the map view open. So the entries are held in a ref and
+// rebuilt on a slow tick instead; 2 Hz is still far quicker than anyone can
+// read a service graph.
+const REBUILD_INTERVAL_MS = 500;
+
 function nodeId(ep: Endpoint): string {
   return ep.name ? (ep.namespace ? `${ep.name}.${ep.namespace}` : ep.name) : ep.ip;
 }
@@ -40,13 +51,22 @@ function nodeId(ep: Endpoint): string {
 // Build a node/edge graph from the most recent `window` entries and lay nodes
 // out on a ring, grouped by namespace so same-namespace services sit next to
 // each other instead of scattering randomly. Intentionally dependency-free
-// (no d3) and recomputes cheaply.
-function buildGraph(entries: Entry[], window: number): { nodes: Node[]; edges: Edge[] } {
+// (no d3).
+//
+// This is the one genuinely hot loop in the front (up to 3000 entries per
+// rebuild), so it avoids per-entry garbage: an index loop rather than
+// entries.slice(0, window) (which copied the whole window every time), and a
+// two-level from→to→edge Map rather than a `${from}→${to}` template-literal
+// key (which allocated and hashed a string per entry). maxCount is folded in
+// here too — it was Math.max(1, ...edges.map(e => e.count)) at the call site,
+// which is both a second pass and a spread that blows the argument limit (and
+// the stack) once a busy cluster produces tens of thousands of distinct edges.
+function buildGraph(entries: Entry[], window: number): { nodes: Node[]; edges: Edge[]; maxCount: number } {
   const nodeMap = new Map<
     string,
     { ns: string; name?: string; ip: string; inCount: number; outCount: number; errIn: number }
   >();
-  const edgeMap = new Map<string, Edge>();
+  const edgeMap = new Map<string, Map<string, Edge>>();
 
   const touch = (ep: Endpoint) => {
     const id = nodeId(ep);
@@ -58,19 +78,29 @@ function buildGraph(entries: Entry[], window: number): { nodes: Node[]; edges: E
     return { id, n };
   };
 
-  for (const e of entries.slice(0, window)) {
+  const count = Math.min(entries.length, window);
+  for (let i = 0; i < count; i++) {
+    const e = entries[i];
     const { id: s, n: sn } = touch(e.src);
     const { id: d, n: dn } = touch(e.dst);
+    const isError = e.status === "error";
     sn.outCount++;
     dn.inCount++;
-    if (e.status === "error") dn.errIn++;
+    if (isError) dn.errIn++;
 
-    const key = `${s}→${d}`;
-    const edge = edgeMap.get(key) ?? { from: s, to: d, count: 0, errors: 0, totalLatencyMs: 0 };
+    let outEdges = edgeMap.get(s);
+    if (!outEdges) {
+      outEdges = new Map();
+      edgeMap.set(s, outEdges);
+    }
+    let edge = outEdges.get(d);
+    if (!edge) {
+      edge = { from: s, to: d, count: 0, errors: 0, totalLatencyMs: 0 };
+      outEdges.set(d, edge);
+    }
     edge.count++;
     edge.totalLatencyMs += e.elapsedMs;
-    if (e.status === "error") edge.errors++;
-    edgeMap.set(key, edge);
+    if (isError) edge.errors++;
   }
 
   // Group by namespace (then id) so the ring reads as clusters, not a
@@ -101,7 +131,16 @@ function buildGraph(entries: Entry[], window: number): { nodes: Node[]; edges: E
     };
   });
 
-  return { nodes, edges: [...edgeMap.values()] };
+  const edges: Edge[] = [];
+  let maxCount = 1;
+  for (const outEdges of edgeMap.values()) {
+    for (const edge of outEdges.values()) {
+      edges.push(edge);
+      if (edge.count > maxCount) maxCount = edge.count;
+    }
+  }
+
+  return { nodes, edges, maxCount };
 }
 
 const NS_COLORS = ["#4aa8ff", "#b07cff", "#37c98b", "#ffb454", "#ff6b6b", "#22d3ee"];
@@ -127,9 +166,32 @@ export function ServiceMap({
   onNodeClick?: (clause: string) => void;
 }) {
   const [windowSize, setWindowSize] = useState<number>(800);
-  const { nodes, edges } = useMemo(() => buildGraph(entries, windowSize), [entries, windowSize]);
+
+  // The graph is rebuilt from entriesRef on a tick, not from the `entries`
+  // prop identity — see REBUILD_INTERVAL_MS. The ref is written during render
+  // so the next tick always aggregates the latest buffer; builtFromRef records
+  // which buffer the current graph came from, so an idle stream ticks without
+  // churning state (and through it the whole SVG) for an identical graph.
+  const entriesRef = useRef(entries);
+  entriesRef.current = entries;
+  const builtFromRef = useRef<Entry[] | null>(null);
+  const [rebuildTick, setRebuildTick] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (entriesRef.current !== builtFromRef.current) setRebuildTick((t) => t + 1);
+    }, REBUILD_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  const { nodes, edges, maxCount } = useMemo(() => {
+    builtFromRef.current = entriesRef.current;
+    return buildGraph(entriesRef.current, windowSize);
+    // rebuildTick is the whole point: it, not the entries identity, is what
+    // paces the (expensive) re-aggregation. A window change rebuilds at once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rebuildTick, windowSize]);
   const pos = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
-  const maxCount = Math.max(1, ...edges.map((e) => e.count));
 
   const nsList = useMemo(() => [...new Set(nodes.map((n) => n.ns))].sort(), [nodes]);
 
@@ -178,12 +240,15 @@ export function ServiceMap({
     dragRef.current = null;
   };
 
-  const showTooltip = (e: React.MouseEvent, title: string, rows: Array<[string, string]>) => {
+  // Stable identities so the memo() on MapEdge/MapNode holds: hovering or
+  // panning re-renders this component on every mousemove, and without the memo
+  // that reconciled all ~1000 edge/node elements just to move a tooltip div.
+  const showTooltip = useCallback((e: React.MouseEvent, title: string, rows: Array<[string, string]>) => {
     const rect = wrapRef.current?.getBoundingClientRect();
     if (!rect) return;
     setHover({ x: e.clientX - rect.left, y: e.clientY - rect.top, title, rows });
-  };
-
+  }, []);
+  const hideTooltip = useCallback(() => setHover(null), []);
 
   if (nodes.length === 0) {
     return <div className="map-empty">No traffic yet — the service map builds itself from live flows.</div>;
@@ -230,108 +295,28 @@ export function ServiceMap({
             const a = pos.get(e.from);
             const b = pos.get(e.to);
             if (!a || !b) return null;
-            const err = e.errors > 0;
-            const w = 0.6 + (e.count / maxCount) * 4;
-            const avgMs = Math.round(e.totalLatencyMs / e.count);
-            const rows: Array<[string, string]> = [
-              ["calls", String(e.count)],
-              ["avg latency", `${avgMs} ms`],
-              ["errors", String(e.errors)],
-            ];
-            const tt = (ev: React.MouseEvent) => showTooltip(ev, `${a.label} → ${b.label}`, rows);
-
-            if (a === b) {
-              return (
-                <g key={`${e.from}-${e.to}`}>
-                  <path
-                    d={loopPath(a.x, a.y)}
-                    fill="none"
-                    stroke={err ? "var(--err)" : "var(--map-edge-default)"}
-                    strokeWidth={w}
-                    strokeOpacity={0.9}
-                  />
-                  <path
-                    d={loopPath(a.x, a.y)}
-                    fill="none"
-                    stroke="transparent"
-                    strokeWidth={14}
-                    onMouseEnter={tt}
-                    onMouseMove={tt}
-                    onMouseLeave={() => setHover(null)}
-                  />
-                  <text x={a.x} y={a.y - NODE_R * 2.5} textAnchor="middle" className="map-label map-loop-count">
-                    ×{e.count}
-                  </text>
-                </g>
-              );
-            }
-
             return (
-              <g key={`${e.from}-${e.to}`}>
-                <line
-                  x1={a.x}
-                  y1={a.y}
-                  x2={b.x}
-                  y2={b.y}
-                  stroke={err ? "var(--err)" : "var(--map-edge-default)"}
-                  strokeWidth={w}
-                  strokeOpacity={err ? 0.9 : 0.55}
-                  markerEnd={err ? "url(#arrow-err)" : "url(#arrow)"}
-                />
-                <line
-                  x1={a.x}
-                  y1={a.y}
-                  x2={b.x}
-                  y2={b.y}
-                  stroke="transparent"
-                  strokeWidth={14}
-                  onMouseEnter={tt}
-                  onMouseMove={tt}
-                  onMouseLeave={() => setHover(null)}
-                />
-              </g>
+              <MapEdge
+                key={`${e.from}-${e.to}`}
+                edge={e}
+                a={a}
+                b={b}
+                maxCount={maxCount}
+                onShowTooltip={showTooltip}
+                onHideTooltip={hideTooltip}
+              />
             );
           })}
 
-          {nodes.map((n) => {
-            const errPct = n.inCount ? Math.round((n.errIn / n.inCount) * 100) : 0;
-            const rows: Array<[string, string]> = [
-              ["namespace", n.ns || "—"],
-              ["in", String(n.inCount)],
-              ["out", String(n.outCount)],
-              ["errors", `${n.errIn} (${errPct}%)`],
-            ];
-            const tt = (ev: React.MouseEvent) => showTooltip(ev, n.label, rows);
-            const activate = () => onNodeClick?.(endpointClause(n));
-            // Mouse users get the rich hover tooltip; keyboard/AT users get the
-            // same numbers folded into the accessible name instead, since a
-            // cursor-anchored tooltip has no meaningful position on focus.
-            const a11yLabel = `${n.label}, ${n.ns || "no namespace"}, ${n.inCount} in, ${n.outCount} out, ${errPct}% errors. Activate to filter by this service.`;
-            return (
-              <g
-                key={n.id}
-                className="map-node"
-                role="button"
-                tabIndex={0}
-                aria-label={a11yLabel}
-                onMouseEnter={tt}
-                onMouseMove={tt}
-                onMouseLeave={() => setHover(null)}
-                onClick={activate}
-                onKeyDown={(ev) => {
-                  if (ev.key === "Enter" || ev.key === " ") {
-                    ev.preventDefault();
-                    activate();
-                  }
-                }}
-              >
-                <circle cx={n.x} cy={n.y} r={NODE_R} fill="var(--map-node-fill)" stroke={nsColor(n.ns)} strokeWidth={2.5} />
-                <text x={n.x} y={n.y + 38} textAnchor="middle" className="map-label">
-                  {n.label}
-                </text>
-              </g>
-            );
-          })}
+          {nodes.map((n) => (
+            <MapNode
+              key={n.id}
+              n={n}
+              onShowTooltip={showTooltip}
+              onHideTooltip={hideTooltip}
+              onNodeClick={onNodeClick}
+            />
+          ))}
         </svg>
 
         {hover && (
@@ -360,3 +345,141 @@ export function ServiceMap({
     </div>
   );
 }
+
+type ShowTooltip = (e: React.MouseEvent, title: string, rows: Array<[string, string]>) => void;
+
+// MapEdge / MapNode are memo()'d for one reason: hovering (tooltip) and
+// dragging (viewBox) re-render ServiceMap on every single mousemove, and both
+// pieces of state live above the graph. Without the memo each of those
+// re-renders re-created and reconciled every element in the SVG — a thousand
+// of them on a busy cluster — to move one absolutely-positioned div or change
+// one viewBox attribute. Their props all come from the graph memo (node/edge
+// objects, both stable between rebuilds) or from useCallback'd handlers, so
+// they only re-render when the graph is actually rebuilt.
+const MapEdge = memo(function MapEdge({
+  edge,
+  a,
+  b,
+  maxCount,
+  onShowTooltip,
+  onHideTooltip,
+}: {
+  edge: Edge;
+  a: Node;
+  b: Node;
+  maxCount: number;
+  onShowTooltip: ShowTooltip;
+  onHideTooltip: () => void;
+}) {
+  const err = edge.errors > 0;
+  const w = 0.6 + (edge.count / maxCount) * 4;
+  const avgMs = Math.round(edge.totalLatencyMs / edge.count);
+  const rows: Array<[string, string]> = [
+    ["calls", String(edge.count)],
+    ["avg latency", `${avgMs} ms`],
+    ["errors", String(edge.errors)],
+  ];
+  const tt = (ev: React.MouseEvent) => onShowTooltip(ev, `${a.label} → ${b.label}`, rows);
+
+  if (a === b) {
+    return (
+      <g>
+        <path
+          d={loopPath(a.x, a.y)}
+          fill="none"
+          stroke={err ? "var(--err)" : "var(--map-edge-default)"}
+          strokeWidth={w}
+          strokeOpacity={0.9}
+        />
+        <path
+          d={loopPath(a.x, a.y)}
+          fill="none"
+          stroke="transparent"
+          strokeWidth={14}
+          onMouseEnter={tt}
+          onMouseMove={tt}
+          onMouseLeave={onHideTooltip}
+        />
+        <text x={a.x} y={a.y - NODE_R * 2.5} textAnchor="middle" className="map-label map-loop-count">
+          ×{edge.count}
+        </text>
+      </g>
+    );
+  }
+
+  return (
+    <g>
+      <line
+        x1={a.x}
+        y1={a.y}
+        x2={b.x}
+        y2={b.y}
+        stroke={err ? "var(--err)" : "var(--map-edge-default)"}
+        strokeWidth={w}
+        strokeOpacity={err ? 0.9 : 0.55}
+        markerEnd={err ? "url(#arrow-err)" : "url(#arrow)"}
+      />
+      <line
+        x1={a.x}
+        y1={a.y}
+        x2={b.x}
+        y2={b.y}
+        stroke="transparent"
+        strokeWidth={14}
+        onMouseEnter={tt}
+        onMouseMove={tt}
+        onMouseLeave={onHideTooltip}
+      />
+    </g>
+  );
+});
+
+const MapNode = memo(function MapNode({
+  n,
+  onShowTooltip,
+  onHideTooltip,
+  onNodeClick,
+}: {
+  n: Node;
+  onShowTooltip: ShowTooltip;
+  onHideTooltip: () => void;
+  onNodeClick?: (clause: string) => void;
+}) {
+  const errPct = n.inCount ? Math.round((n.errIn / n.inCount) * 100) : 0;
+  const rows: Array<[string, string]> = [
+    ["namespace", n.ns || "—"],
+    ["in", String(n.inCount)],
+    ["out", String(n.outCount)],
+    ["errors", `${n.errIn} (${errPct}%)`],
+  ];
+  const tt = (ev: React.MouseEvent) => onShowTooltip(ev, n.label, rows);
+  const activate = () => onNodeClick?.(endpointClause(n));
+  // Mouse users get the rich hover tooltip; keyboard/AT users get the same
+  // numbers folded into the accessible name instead, since a cursor-anchored
+  // tooltip has no meaningful position on focus.
+  const a11yLabel = `${n.label}, ${n.ns || "no namespace"}, ${n.inCount} in, ${n.outCount} out, ${errPct}% errors. Activate to filter by this service.`;
+
+  return (
+    <g
+      className="map-node"
+      role="button"
+      tabIndex={0}
+      aria-label={a11yLabel}
+      onMouseEnter={tt}
+      onMouseMove={tt}
+      onMouseLeave={onHideTooltip}
+      onClick={activate}
+      onKeyDown={(ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          activate();
+        }
+      }}
+    >
+      <circle cx={n.x} cy={n.y} r={NODE_R} fill="var(--map-node-fill)" stroke={nsColor(n.ns)} strokeWidth={2.5} />
+      <text x={n.x} y={n.y + 38} textAnchor="middle" className="map-label">
+        {n.label}
+      </text>
+    </g>
+  );
+});

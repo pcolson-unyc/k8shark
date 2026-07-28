@@ -334,7 +334,10 @@ func attachDemoL4(rnd *rand.Rand, e *api.Entry) {
 // populated in demo mode (live capture fills this from the actual stream).
 func demoRaw(s string) *api.RawView {
 	b := []byte(s)
-	return &api.RawView{Hex: hexDump(b, 512), Bytes: len(b)}
+	if len(b) > 512 {
+		b = b[:512]
+	}
+	return &api.RawView{Data: b, Bytes: len(s), Truncated: len(s) > len(b)}
 }
 
 // demoRESP renders a command as a RESP array, for the Redis Raw view.

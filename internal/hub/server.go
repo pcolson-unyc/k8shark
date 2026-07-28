@@ -87,13 +87,18 @@ type Server struct {
 	mu           sync.RWMutex
 	frontClients map[*frontClient]struct{}
 	workerCount  int32
+	// frontCount mirrors len(frontClients), maintained at the register and
+	// unregister sites so the per-entry broadcast fast path can test "is
+	// anyone listening?" without taking mu. See broadcast for why reading it
+	// lock-free is safe.
+	frontCount atomic.Int32
 
 	// wmu guards workers (the per-node registry behind /api/workers) and
 	// workerConns (live connections' send channels, used to deliver
 	// pause/resume commands). Separate from mu so per-entry bookkeeping
 	// never contends with the broadcast path.
 	wmu         sync.Mutex
-	workers     map[string]*workerInfo
+	workers     map[string]*workerEntry
 	workerConns map[string]chan []byte
 
 	broadcastDropped int64 // entries dropped to slow front clients (atomic)
@@ -128,6 +133,17 @@ const statsHistoryCap = 300
 // answerable during an incident.
 const workerGCTTL = time.Hour
 
+// workerReadLimit bounds the per-message allocation on a worker connection.
+// It is deliberately larger than the front-end limit: a worker coalesces
+// whatever is already queued into one MsgEntryBatch frame (see
+// sinkBatchMaxBytes in internal/worker/sink.go, currently 512 KiB), and a frame
+// over this limit doesn't get truncated — gorilla fails the read and the
+// connection dies, so an undersized limit here reads as a worker that
+// reconnects forever under load. The margin over the worker's own budget covers
+// a single pathological entry, which the worker always includes rather than
+// dropping captured traffic to stay under budget.
+const workerReadLimit = 4 << 20
+
 // New builds a hub.
 func New(log *slog.Logger, opts Options) *Server {
 	size := opts.BufferSize
@@ -144,10 +160,31 @@ func New(log *slog.Logger, opts Options) *Server {
 		tlsCert:      opts.TLSCert,
 		tlsKey:       opts.TLSKey,
 		frontClients: map[*frontClient]struct{}{},
-		workers:      map[string]*workerInfo{},
+		workers:      map[string]*workerEntry{},
 		workerConns:  map[string]chan []byte{},
 		resolver:     newResolver(log),
 		uiDir:        opts.UIDir,
+		// EnableCompression is deliberately left off. permessage-deflate was
+		// evaluated and rejected on measurement, not on principle — recorded
+		// here so it doesn't get re-litigated every time someone notices the
+		// entries are JSON:
+		//
+		//   realistic HTTP entry, post RawView.Data:  5747 B
+		//   deflated (level -1, writer reused):        749 B  (7.67x)
+		//   marginal CPU, writer reused via Reset:    30.6 us/entry
+		//
+		// 30.6 us/entry is 6.1% of a core per subscribed client at 2000
+		// entries/s — and it burns on the fan-out goroutine, i.e. exactly the
+		// one being unblocked. Two viewers exceed the hub's whole 100m CPU
+		// request (helm/k8shark/values.yaml). The ratio also fell from the
+		// ~12x measured before RawView.Data, because the pre-rendered hexdump
+		// text that used to dominate every entry was the highly compressible
+		// part; shrinking the payload took most of compression's prize with it.
+		// Meanwhile the genuinely large responses are the REST ones, and nginx
+		// now gzips those (build/nginx.conf.template) off the hot path.
+		//
+		// Enabling it would also invalidate the shared-batch-bytes optimisation
+		// in flushBroadcast, since gorilla mutates the payload when compressing.
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -280,6 +317,66 @@ type workerInfo struct {
 	TCPLossEvents uint64    `json:"tcpLossEvents"` // AF_PACKET TCP directions truncated after a lost segment (FIFO desync guard)
 }
 
+// workerEntry is the registry's internal row. The cold fields live in info,
+// guarded by wmu; the two counters the ingest path touches for *every* entry
+// are atomics next to it, so that path never takes a mutex. A plain
+// sync.Mutex is fine at today's worker counts, but it is the wrong shape for a
+// lock every worker pod's read goroutine hits per entry — at 50+ nodes the
+// contention grows with the fleet even though the work is per-node bookkeeping
+// that never needs to be serialised across nodes.
+type workerEntry struct {
+	info workerInfo // guarded by Server.wmu
+
+	entries  atomic.Int64 // entries ingested from this worker
+	lastSeen atomic.Int64 // unix nanos of the last ingested entry; 0 = none yet
+}
+
+// snapshot folds the atomics back into a plain workerInfo for JSON/metrics.
+// info.Entries is *added* to rather than replaced: the ingest path only ever
+// touches the atomic, so info.Entries is normally 0, but workerUpdate exposes
+// the field and tests seed it directly — summing keeps both visible instead of
+// silently discarding one.
+func (we *workerEntry) snapshot() workerInfo {
+	info := we.info
+	info.Entries += we.entries.Load()
+	info.LastSeen = we.lastSeenTime()
+	return info
+}
+
+// lastSeenTime is the later of the wmu-guarded LastSeen (hello, worker stats,
+// tests) and the ingest path's atomic one.
+func (we *workerEntry) lastSeenTime() time.Time {
+	if ns := we.lastSeen.Load(); ns != 0 {
+		if t := time.Unix(0, ns); t.After(we.info.LastSeen) {
+			return t
+		}
+	}
+	return we.info.LastSeen
+}
+
+// ingest runs one entry through the full worker-side path: k8s enrichment,
+// then the store (which assigns Seq and caches the marshaled JSON), then
+// fan-out and export off that same cached JSON so neither re-marshals.
+// Shared by the MsgEntry and MsgEntryBatch branches so a batched entry can
+// never take a different path from an unbatched one.
+func (s *Server) ingest(e *api.Entry) {
+	s.resolver.enrich(e)
+	raw := s.store.add(e)
+	s.broadcast(e, raw)
+	s.exporter.export(raw) // nil-safe; no-op when export unconfigured
+}
+
+// recordWorkerEntries credits n entries to a worker's registry row. Lock-free:
+// this is per-connection state that nothing needs serialised across workers.
+// A nil row is a pre-hello connection, which isn't tracked at all.
+func recordWorkerEntries(row *workerEntry, n int) {
+	if row == nil || n == 0 {
+		return
+	}
+	row.entries.Add(int64(n))
+	row.lastSeen.Store(time.Now().UnixNano())
+}
+
 func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, wsUpgradeHeader(r))
 	if err != nil {
@@ -287,7 +384,7 @@ func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	conn.SetReadLimit(1 << 20) // bound per-message allocation (1 MiB)
+	conn.SetReadLimit(workerReadLimit)
 
 	atomic.AddInt32(&s.workerCount, 1)
 	defer atomic.AddInt32(&s.workerCount, -1)
@@ -299,6 +396,11 @@ func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 	go s.workerWriter(conn, send)
 
 	node := "unknown"
+	// row is this connection's registry row, resolved once at hello so the
+	// per-entry bookkeeping below is two atomic stores rather than a map
+	// lookup under a global mutex. nil until hello arrives (a pre-hello
+	// connection isn't tracked at all — see workerRow).
+	var row *workerEntry
 	defer func() {
 		s.workerUpdate(node, func(wi *workerInfo) { wi.Connected = false })
 		s.wmu.Lock()
@@ -327,6 +429,7 @@ func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 				version := env.Hello.Version
 				s.log.Info("worker connected", "node", node, "version", version)
 				now := time.Now()
+				row = s.workerRow(node)
 				s.workerUpdate(node, func(wi *workerInfo) {
 					wi.Version = version
 					wi.Connected = true
@@ -339,15 +442,24 @@ func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 			}
 		case api.MsgEntry:
 			if env.Entry != nil {
-				s.resolver.enrich(env.Entry)
-				raw := s.store.add(env.Entry)
-				s.broadcast(env.Entry, raw)
-				s.exporter.export(raw) // nil-safe; no-op when export unconfigured
-				s.workerUpdate(node, func(wi *workerInfo) {
-					wi.Entries++
-					wi.LastSeen = time.Now()
-				})
+				s.ingest(env.Entry)
+				recordWorkerEntries(row, 1)
 			}
+		case api.MsgEntryBatch:
+			// A batch is semantically identical to its entries arriving as
+			// individual MsgEntry frames, oldest first — the worker only
+			// coalesces what was already queued (see sink.assembleBatch). The
+			// per-connection bookkeeping is hoisted out of the loop: it is the
+			// whole batch's worth of work reported once, not per entry.
+			n := 0
+			for _, e := range env.Entries {
+				if e == nil {
+					continue
+				}
+				s.ingest(e)
+				n++
+			}
+			recordWorkerEntries(row, n)
 		case api.MsgWorkerStats:
 			if ws := env.WorkerStats; ws != nil {
 				s.workerUpdate(node, func(wi *workerInfo) {
@@ -436,19 +548,33 @@ func (s *Server) handleWorkerCapture(w http.ResponseWriter, r *http.Request) {
 }
 
 // workerUpdate applies fn to node's registry row, creating it on first sight.
-// A pre-hello connection ("unknown" node) is not tracked.
+// A pre-hello connection ("unknown" node) is not tracked. This is the cold
+// path (connect/disconnect, periodic worker stats) — the per-entry counters go
+// through workerEntry's atomics instead, see handleWorker.
 func (s *Server) workerUpdate(node string, fn func(*workerInfo)) {
+	if we := s.workerRow(node); we != nil {
+		s.wmu.Lock()
+		fn(&we.info)
+		s.wmu.Unlock()
+	}
+}
+
+// workerRow returns node's registry row, creating it on first sight, or nil
+// for an untracked ("" / pre-hello "unknown") node. handleWorker resolves the
+// row once at hello and then updates its atomics directly, so the per-entry
+// path costs neither a map lookup nor wmu.
+func (s *Server) workerRow(node string) *workerEntry {
 	if node == "" || node == "unknown" {
-		return
+		return nil
 	}
 	s.wmu.Lock()
-	wi := s.workers[node]
-	if wi == nil {
-		wi = &workerInfo{Node: node}
-		s.workers[node] = wi
+	defer s.wmu.Unlock()
+	we := s.workers[node]
+	if we == nil {
+		we = &workerEntry{info: workerInfo{Node: node}}
+		s.workers[node] = we
 	}
-	fn(wi)
-	s.wmu.Unlock()
+	return we
 }
 
 // gcWorkers removes registry rows for workers disconnected for more than
@@ -457,8 +583,8 @@ func (s *Server) workerUpdate(node string, fn func(*workerInfo)) {
 func (s *Server) gcWorkers() {
 	cutoff := time.Now().Add(-workerGCTTL)
 	s.wmu.Lock()
-	for node, wi := range s.workers {
-		if !wi.Connected && wi.LastSeen.Before(cutoff) {
+	for node, we := range s.workers {
+		if !we.info.Connected && we.lastSeenTime().Before(cutoff) {
 			delete(s.workers, node)
 		}
 	}
@@ -469,8 +595,8 @@ func (s *Server) gcWorkers() {
 func (s *Server) workerSnapshot() []workerInfo {
 	s.wmu.Lock()
 	out := make([]workerInfo, 0, len(s.workers))
-	for _, wi := range s.workers {
-		out = append(out, *wi)
+	for _, we := range s.workers {
+		out = append(out, we.snapshot())
 	}
 	s.wmu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Node < out[j].Node })
@@ -484,7 +610,33 @@ type frontClient struct {
 	send chan []byte
 	mu   sync.RWMutex
 	pred Predicate
+	// filterKey identifies pred for the purpose of sharing one assembled
+	// batch frame between clients (see flushBroadcast). It is derived from the
+	// filter *source*, never from the Predicate value: CompileFilter("")
+	// returns a non-nil always-true closure, so "no filter" can't be detected
+	// with a nil check, and two closures compiled from the same source are
+	// never comparable as values.
+	//
+	// The empty string is reserved for "unknown" — a frontClient built without
+	// going through handleFront/frontReader, i.e. a test — and is never
+	// shared: such a client always gets a group of its own, so an unset key
+	// can't silently pool clients whose predicates differ. Guarded by mu
+	// alongside pred.
+	filterKey string
+	// queuedBytes is the total size of the frames sitting in send, kept so the
+	// queue can be bounded by bytes and not just by slot count (see trySend).
+	queuedBytes atomic.Int64
 }
+
+// filterKeySource builds a frontClient.filterKey for a successfully compiled
+// filter. The prefix keeps it out of the reserved "" (unknown) and
+// filterKeyReject values.
+func filterKeySource(filter string) string { return "f:" + filter }
+
+// filterKeyReject is the key of the match-nothing predicate installed when a
+// client's ?filter= fails to compile. No filter source can produce it, so
+// those clients pool only with each other.
+const filterKeyReject = "!reject"
 
 func (s *Server) handleFront(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, wsUpgradeHeader(r))
@@ -512,9 +664,13 @@ func (s *Server) handleFront(w http.ResponseWriter, r *http.Request) {
 		pred = func(*api.Entry) bool { return false }
 	}
 	c := &frontClient{
-		conn: conn,
-		send: make(chan []byte, 256),
-		pred: pred,
+		conn:      conn,
+		send:      make(chan []byte, 256),
+		pred:      pred,
+		filterKey: filterKeySource(r.URL.Query().Get("filter")),
+	}
+	if filterErr != nil {
+		c.filterKey = filterKeyReject
 	}
 
 	s.log.Debug("front client connected", "remote", r.RemoteAddr)
@@ -538,6 +694,7 @@ func (s *Server) handleFront(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.frontClients[c] = struct{}{}
+	s.frontCount.Store(int32(len(s.frontClients)))
 	s.mu.Unlock()
 
 	go s.frontReader(c)
@@ -549,6 +706,7 @@ func (s *Server) frontReader(c *frontClient) {
 	defer func() {
 		s.mu.Lock()
 		delete(s.frontClients, c)
+		s.frontCount.Store(int32(len(s.frontClients)))
 		s.mu.Unlock()
 		close(c.send)
 	}()
@@ -578,6 +736,7 @@ func (s *Server) frontReader(c *frontClient) {
 			s.replayHistory(c, pred)
 			c.mu.Lock()
 			c.pred = pred
+			c.filterKey = filterKeySource(env.Filter)
 			c.mu.Unlock()
 		}
 	}
@@ -643,7 +802,12 @@ func (s *Server) frontWriter(c *frontClient) {
 				_ = c.conn.WriteMessage(websocket.CloseMessage, nil)
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.TextMessage, b); err != nil {
+			err := c.conn.WriteMessage(websocket.TextMessage, b)
+			// Release the frame's byte reservation once it has left the queue,
+			// whether or not the write succeeded — on failure this writer is
+			// about to exit and the client is torn down anyway.
+			c.queuedBytes.Add(-int64(len(b)))
+			if err != nil {
 				return
 			}
 		case <-ticker.C:
@@ -654,22 +818,51 @@ func (s *Server) frontWriter(c *frontClient) {
 	}
 }
 
+// frontQueueBytes bounds a front client's pending frames by size. The slot
+// count alone is not a bound worth anything here: every element of send is a
+// whole batch frame — around a megabyte under live load, a couple on replay —
+// so 256 slots admit hundreds of megabytes against a pod that typically runs
+// with a 512Mi limit. One backgrounded browser tab that stops reading is
+// enough to reach that, so the queue is capped by bytes too.
+//
+// The floor on the value is a full history replay: handleFront queues all
+// ~500 entries (replayBatchSize at a time) *before* frontWriter starts
+// draining, so a budget under that would silently truncate the newest history
+// on a busy hub — replayHistory sends oldest-chunk-first. 16 MiB clears that
+// with headroom while still cutting the pathological case by ~20x.
+const frontQueueBytes = 16 << 20
+
 // trySend queues b for the client without blocking. It reports false when the
-// buffer is full (a slow client), so the caller can account for the drop.
+// client is too far behind — either the slot buffer is full or the queued
+// bytes would exceed frontQueueBytes — so the caller can account for the drop.
 func (c *frontClient) trySend(b []byte) bool {
+	n := int64(len(b))
+	// Reserve first, release on failure: frontWriter decrements concurrently,
+	// so incrementing only after a successful send would let the counter go
+	// negative. A frame larger than the whole budget is still admitted when
+	// the queue is empty (queued == n after the reservation), so an unusually
+	// large batch can never permanently starve a client that is keeping up.
+	if queued := c.queuedBytes.Add(n); queued > frontQueueBytes && queued != n {
+		c.queuedBytes.Add(-n)
+		return false
+	}
 	select {
 	case c.send <- b:
 		return true
 	default:
 		// Slow client: drop rather than block the broadcaster.
+		c.queuedBytes.Add(-n)
 		return false
 	}
 }
 
-func (c *frontClient) matches(e *api.Entry) bool {
+// snapshotFilter reads the client's current predicate and its grouping key in
+// one lock acquisition, so flushBroadcast pays c.mu once per client per flush
+// instead of once per client per entry.
+func (c *frontClient) snapshotFilter() (Predicate, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.pred == nil || c.pred(e)
+	return c.pred, c.filterKey
 }
 
 // pendingEntry is one not-yet-flushed live entry: the entry for per-client
@@ -694,11 +887,23 @@ func (s *Server) broadcast(e *api.Entry, raw []byte) {
 		return
 	}
 	// Fast path: with no front clients, don't even queue.
-	s.mu.RLock()
-	empty := len(s.frontClients) == 0
-	s.mu.RUnlock()
-	if empty {
-		return
+	//
+	// frontCount is a hint maintained at the register/unregister sites, read
+	// here without a lock so the ingest path doesn't touch s.mu once per
+	// entry. It is only ever trusted in the positive direction: a non-zero
+	// count means "there is at least one listener, go queue", while a zero
+	// falls back to confirming under the lock. That asymmetry is what keeps
+	// the hint safe — a client inserted into s.frontClients directly (tests
+	// do this to drive the fan-out by hand) leaves the counter at zero and is
+	// still found by the fallback, and the fallback only runs on the idle
+	// path, where there is no fan-out work to be saved anyway.
+	if s.frontCount.Load() == 0 {
+		s.mu.RLock()
+		empty := len(s.frontClients) == 0
+		s.mu.RUnlock()
+		if empty {
+			return
+		}
 	}
 	s.bmu.Lock()
 	s.pending = append(s.pending, pendingEntry{entry: e, raw: raw})
@@ -713,6 +918,21 @@ func (s *Server) broadcast(e *api.Entry, raw []byte) {
 // MsgEntryBatch frame with the subset matching its filter, assembled from the
 // entries' cached JSON. A client whose send buffer is full drops the whole
 // batch (counted per entry in broadcastDropped, keeping the metric's unit).
+//
+// Clients that share a filter share the work: the predicate is snapshotted
+// once per client per flush (rather than re-locked per entry), clients with
+// the same filter key are grouped, and each group runs the per-entry match
+// loop and assembleBatch exactly once. On a dashboard where every open tab
+// carries the same filter — the normal case — that turns O(clients × entries)
+// predicate calls and O(clients) megabyte-scale frame builds into O(entries)
+// and O(1).
+//
+// The resulting []byte is then handed to every client in the group. That is
+// safe because the frame is concatenated store JSON that nothing mutates:
+// frontWriter only reads it, and no WebSocket compression is negotiated.
+// WARNING: re-verify this if permessage-deflate is ever enabled on the
+// upgrader — gorilla's compressing writer mutates the payload buffer, and
+// sharing one frame across clients would then corrupt it.
 func (s *Server) flushBroadcast() {
 	s.bmu.Lock()
 	batch := s.pending
@@ -721,20 +941,50 @@ func (s *Server) flushBroadcast() {
 	if len(batch) == 0 {
 		return
 	}
+
+	// filterGroup is the set of clients that will receive byte-identical
+	// frames for this flush.
+	type filterGroup struct {
+		pred    Predicate
+		clients []*frontClient
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	groups := make([]*filterGroup, 0, len(s.frontClients))
+	byKey := make(map[string]*filterGroup, len(s.frontClients))
 	for c := range s.frontClients {
-		raws := make([][]byte, 0, len(batch))
+		pred, key := c.snapshotFilter()
+		if key != "" {
+			if g := byKey[key]; g != nil {
+				g.clients = append(g.clients, c)
+				continue
+			}
+		}
+		g := &filterGroup{pred: pred, clients: []*frontClient{c}}
+		if key != "" {
+			byKey[key] = g
+		}
+		groups = append(groups, g)
+	}
+
+	raws := make([][]byte, 0, len(batch))
+	for _, g := range groups {
+		raws = raws[:0]
 		for _, p := range batch {
-			if c.matches(p.entry) {
+			if g.pred == nil || g.pred(p.entry) {
 				raws = append(raws, p.raw)
 			}
 		}
 		if len(raws) == 0 {
 			continue
 		}
-		if !c.trySend(assembleBatch(raws)) {
-			atomic.AddInt64(&s.broadcastDropped, int64(len(raws)))
+		frame := assembleBatch(raws)
+		for _, c := range g.clients {
+			if !c.trySend(frame) {
+				atomic.AddInt64(&s.broadcastDropped, int64(len(raws)))
+			}
 		}
 	}
 }
@@ -821,6 +1071,9 @@ func (s *Server) handleEntries(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unknown or non-numeric sort field: "+sortField, http.StatusBadRequest)
 			return
 		}
+		// The only branch that still marshals from structs: reordering needs
+		// the entries themselves, so the store's cached per-entry JSON (which
+		// the unsorted paths below splice in verbatim) can't be used here.
 		matched := s.store.recent(s.store.capacity, pred)
 		writeJSON(w, topNBySort(matched, fieldGetter(sortField), desc, limit))
 		return
@@ -837,14 +1090,14 @@ func (s *Server) handleEntries(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid before_seq: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, s.store.recentBeforeSeq(n, limit, pred))
+		writeJSONArray(w, s.store.recentBeforeSeqRaw(n, limit, pred))
 		return
 	}
 	if before := r.URL.Query().Get("before"); before != "" {
-		writeJSON(w, s.store.recentBefore(before, limit, pred))
+		writeJSONArray(w, s.store.recentBeforeRaw(before, limit, pred))
 		return
 	}
-	writeJSON(w, s.store.recent(limit, pred))
+	writeJSONArray(w, s.store.recentRaw(limit, pred))
 }
 
 // sortOrder parses ?order=asc|desc for handleEntries' ?sort=, defaulting to
@@ -1264,6 +1517,34 @@ func (s *Server) fieldValuesFor(spec FieldSpec, prefix string, limit int) []Fiel
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeJSONArray writes raws as a JSON array without re-marshaling anything:
+// the elements are the store's cached per-entry JSON, produced by the same
+// encoder (and therefore the same HTML-escaping rules) writeJSON would use.
+// The output is byte-for-byte what writeJSON would have emitted for the
+// equivalent []*api.Entry — including the trailing newline json.Encoder adds —
+// which is what TestHandleEntriesRawJSONMatchesStructs pins down. A history
+// page is several MB of entries, so skipping the round-trip through reflection
+// is the difference between a page being free and being the most expensive
+// thing the hub does per request.
+func writeJSONArray(w http.ResponseWriter, raws [][]byte) {
+	size := len("[]\n") + len(raws)
+	for _, r := range raws {
+		size += len(r)
+	}
+	b := make([]byte, 0, size)
+	b = append(b, '[')
+	for i, r := range raws {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, r...)
+	}
+	b = append(b, ']', '\n')
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(b)
 }
 
 // withAuth enforces the optional tokens on /api/* and the WebSocket

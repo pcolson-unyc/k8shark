@@ -52,6 +52,21 @@ export interface HubState {
   returnToLive: () => void;
 }
 
+// flushUpdater builds the setEntries updater one flush uses: prepend this
+// frame's batch (already newest-first) and trim to the cap. Factored out of
+// flush() — and exported — purely so it can be invoked repeatedly in a test:
+// React treats an updater as a pure function of `prev` and may call it more
+// than once for a single update, so it must not mutate the captured batch.
+// (This used to end up doing `batch.reverse().concat(prev)`, which silently
+// re-ordered the batch oldest-first on the second call.)
+export function flushUpdater(batch: Entry[], cap: number): (prev: Entry[]) => Entry[] {
+  return (prev) => {
+    const next = batch.concat(prev);
+    if (next.length > cap) next.length = cap;
+    return next;
+  };
+}
+
 // useHub owns the live connection: it streams entries, keeps a bounded rolling
 // buffer, tracks stats, and pushes filter changes to the server so filtering
 // happens hub-side (matching Kubeshark's model).
@@ -109,6 +124,17 @@ export function useHub(initialFilter: string): HubState {
   const frameRef = useRef<number | null>(null);
   const frameKindRef = useRef<"raf" | "timeout">("raf");
 
+  // Mirrors the last committed entries.length so flush() can decide whether a
+  // batch overflows the cap *outside* the setEntries updater. React treats an
+  // updater as a pure function of `prev` and is free to call it more than once
+  // for the same update (<StrictMode> deliberately double-invokes it in dev),
+  // so the updater must neither mutate its inputs nor call another setState —
+  // see flush() below. Worst case this is one flush stale (React commits
+  // between frames, so in practice it isn't), which would only delay the
+  // "showing latest N" note by a frame.
+  const entriesLenRef = useRef(0);
+  entriesLenRef.current = entries.length;
+
   const cancelScheduledFlush = useCallback(() => {
     if (frameRef.current === null) return;
     if (frameKindRef.current === "raf") cancelAnimationFrame(frameRef.current);
@@ -123,15 +149,15 @@ export function useHub(initialFilter: string): HubState {
       const buf = bufRef.current;
       if (buf.length === 0) return;
       bufRef.current = [];
-      setEntries((prev) => {
-        // buf holds this frame's entries oldest-first; newest goes to the front.
-        const next = buf.reverse().concat(prev);
-        if (next.length > capRef.current) {
-          next.length = capRef.current;
-          setTruncated(true);
-        }
-        return next;
-      });
+      // buf holds this frame's entries oldest-first; newest goes to the front.
+      // Reversed here rather than inside the updater because reverse() mutates
+      // in place: a second invocation of the updater (StrictMode, dev) would
+      // flip the batch back to oldest-first and render it upside down.
+      buf.reverse();
+      // Likewise hoisted out of the updater — queueing a further state update
+      // from inside one is a side effect in what must be a pure function.
+      if (entriesLenRef.current + buf.length > capRef.current) setTruncated(true);
+      setEntries(flushUpdater(buf, capRef.current));
     };
     if (document.visibilityState === "hidden") {
       frameKindRef.current = "timeout";

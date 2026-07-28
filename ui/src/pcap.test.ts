@@ -104,6 +104,41 @@ describe("entriesToPcap", () => {
     expect(payload).toBe("fallback text");
   });
 
+  // firstFramePayload returns the application bytes of the first (and, in these
+  // tests, only) packet record: 24-byte global header, 16-byte record header,
+  // then Ethernet (14) + IPv4 (20) + TCP (20).
+  function firstFramePayload(out: Uint8Array): string {
+    const inclLen = readU32LE(out, 24 + 8);
+    const frame = out.slice(24 + 16, 24 + 16 + inclLen);
+    return new TextDecoder().decode(frame.slice(14 + 20 + 20));
+  }
+
+  // The raw hexdump and the body are capped independently worker-side, so raw
+  // is not always the bigger sample of an exchange.
+  it("exports the body when the raw sample is shorter than it", () => {
+    const body = "GET /health HTTP/1.1\r\nHost: svc\r\nAccept: */*\r\n\r\n";
+    const out = entriesToPcap([
+      // Raw truncated to 8 bytes while the entry still carries the whole body:
+      // a lowered raw-capture cap must not silently shrink the export.
+      entry({ id: "a", request: { body, summary: "GET /health", raw: { hex: hexDumpOf(body.slice(0, 8)), bytes: 8 } }, response: {} }),
+    ]);
+    expect(firstFramePayload(out)).toBe(body);
+  });
+
+  it("exports raw bytes when there is no body at all (generic L4 / DNS)", () => {
+    const out = entriesToPcap([
+      entry({ id: "a", protocol: "tcp", request: { summary: "tcp flow", raw: { hex: hexDumpOf("PING\r\n"), bytes: 6 } }, response: {} }),
+    ]);
+    expect(firstFramePayload(out)).toBe("PING\r\n");
+  });
+
+  it("keeps raw's precedence on a tie — it is the byte-exact capture", () => {
+    const out = entriesToPcap([
+      entry({ id: "a", request: { body: "xxxxxx", raw: { hex: hexDumpOf("PING\r\n"), bytes: 6 } }, response: {} }),
+    ]);
+    expect(firstFramePayload(out)).toBe("PING\r\n");
+  });
+
   it("skips entries with a non-IPv4 (or unparseable) address instead of emitting a malformed packet", () => {
     const out = entriesToPcap([
       entry({ id: "a", src: { ip: "fe80::1", port: 1 }, response: {} }),

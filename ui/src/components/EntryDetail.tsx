@@ -2,6 +2,7 @@ import type { KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { curlCommand } from "../curl";
 import { conversationClause, endpointClause } from "../iflClause";
+import { rawBytes, renderHexDump } from "../rawView";
 import type { Entry, L4Info, Payload, PGColumn, RawView } from "../types";
 
 type TabId = "overview" | "request" | "response" | "headers" | "body" | "raw" | "l4";
@@ -489,15 +490,25 @@ function RawTab({ entry }: { entry: Entry }) {
   );
 }
 
+// RawBlock renders the hexdump for one direction. The dump is built here, in
+// the browser, rather than shipped pre-rendered from the worker: the text is
+// ~4.94x the size of the bytes it describes, and only the one entry whose
+// detail panel is open ever needs it, so rendering it worker-side meant paying
+// that cost for every entry on every hop. useMemo keeps it to once per raw
+// sample rather than once per re-render of the panel.
+//
+// raw.hex is still honoured for entries produced by a worker older than this
+// hub, which pre-rendered the block and sent no bytes.
 function RawBlock({ title, raw }: { title: string; raw: RawView }) {
+  const dump = useMemo(() => (raw.data ? renderHexDump(rawBytes(raw)) : (raw.hex ?? "")), [raw]);
   return (
     <>
       <div className="subhead">
         {title} · first {raw.bytes ?? 0} B of stream
         {raw.truncated && <span className="chip trunc">truncated</span>}
-        {raw.hex && <CopyButton text={raw.hex} label={`${title} raw hex`} />}
+        {dump && <CopyButton text={dump} label={`${title} raw hex`} />}
       </div>
-      <pre className="hex">{raw.hex}</pre>
+      <pre className="hex">{dump}</pre>
     </>
   );
 }

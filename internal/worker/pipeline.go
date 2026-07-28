@@ -54,7 +54,16 @@ type pipeline struct {
 	mongo map[string]*mongoPending // MongoDB pairing, keyed by conn+requestID (see dissect_mongo.go)
 	kafka map[string]*kafkaPending // Kafka pairing, keyed by conn+correlationID (see dissect_kafka.go)
 
-	redisDB map[string]*redisDBState // per-connection Redis DB index (tracked from SELECT n), guarded by mu
+	// afPacketStreams counts the live AF_PACKET stream directions per
+	// connection key (guarded by mu). It is the explicit "which capture path
+	// fed this connection" switch completeResponse consults before deciding to
+	// sleep waiting for a request that hasn't been enqueued yet — see
+	// completeResponsePairRetries. consumeStream, the single AF_PACKET TCP
+	// entry point, registers here; the eBPF TLS path (tls_pipeline.go) never
+	// does, so it keeps the retry behaviour its goroutine race needs. Anything
+	// unregistered therefore defaults to the old, conservative waiting
+	// behaviour.
+	afPacketStreams map[string]int
 
 	flowMu sync.Mutex
 	flows  map[string]*flowState // generic L4 flow accounting, keyed by canonical conn
@@ -92,22 +101,22 @@ type pipeline struct {
 
 func newPipeline(s *sink, node, nodeIP string, log *slog.Logger) *pipeline {
 	return &pipeline{
-		sink:          s,
-		node:          node,
-		nodeIP:        nodeIP,
-		log:           log,
-		conns:         map[string]*connState{},
-		dns:           map[string]*dnsPending{},
-		mongo:         map[string]*mongoPending{},
-		kafka:         map[string]*kafkaPending{},
-		redisDB:       map[string]*redisDBState{},
-		flows:         map[string]*flowState{},
-		respPorts:     map[int]api.Protocol{redisPort: api.ProtocolRedis},
-		amqpPorts:     map[int]bool{amqpPort: true},
-		captureBodies: true,
-		bodyCap:       config.DefaultBodyCaptureBytes,
-		rawCap:        config.DefaultRawCaptureBytes,
-		headerHexCap:  config.DefaultHeaderHexBytes,
+		sink:            s,
+		node:            node,
+		nodeIP:          nodeIP,
+		log:             log,
+		conns:           map[string]*connState{},
+		dns:             map[string]*dnsPending{},
+		mongo:           map[string]*mongoPending{},
+		kafka:           map[string]*kafkaPending{},
+		flows:           map[string]*flowState{},
+		afPacketStreams: map[string]int{},
+		respPorts:       map[int]api.Protocol{redisPort: api.ProtocolRedis},
+		amqpPorts:       map[int]bool{amqpPort: true},
+		captureBodies:   true,
+		bodyCap:         config.DefaultBodyCaptureBytes,
+		rawCap:          config.DefaultRawCaptureBytes,
+		headerHexCap:    config.DefaultHeaderHexBytes,
 	}
 }
 
@@ -141,6 +150,27 @@ type pendingReq struct {
 	req      api.Payload
 	src, dst api.Endpoint
 	ts       time.Time
+
+	// filled reports whether req is complete. Every dissector but HTTP builds
+	// the whole payload before enqueueing it, so it lands here already filled;
+	// consumeHTTPID reserves its slot before reading the request body (see
+	// reserveRequest) and flips this in fillRequest once the body is in. resp
+	// is the hand-off in the other direction: a response that arrived while
+	// this slot was still unfilled is parked here for the request goroutine to
+	// emit. Both fields are guarded by pipeline.mu — the request goroutine
+	// writes them, the response goroutine reads/writes them.
+	filled bool
+	resp   *pendingResp
+}
+
+// pendingResp is a response that reached completeResponse before its own
+// request's body finished being read, parked on the pending request for the
+// request goroutine to emit (see completeResponse / fillRequest).
+type pendingResp struct {
+	payload    api.Payload
+	statusCode int
+	status     string
+	firstByte  time.Time
 }
 
 // reqBacklogCap bounds the per-connection pending-request queue. FIFO pairing
@@ -149,9 +179,73 @@ type pendingReq struct {
 // without limit; on overflow the oldest pending request is dropped.
 const reqBacklogCap = 1024
 
-// enqueueRequest records a request awaiting its response.
+// enqueueRequest records a request awaiting its response and flags the
+// connection as L7-dissected.
+//
+// Dissectors that flag the connection themselves (the Mongo, Kafka and
+// DNS-over-TCP paths hoist markL7 out of their parse loop; consumeHTTPID calls
+// it per request but also reserves its pending slot early) call
+// enqueueRequestOnly instead. Note that hoisting markL7 out of a parse loop is
+// only safe for connections that don't sit idle: flushFlows reaps an idle flow
+// regardless of its l7 flag, and a flow recreated after that reap needs
+// re-flagging — see the comment on the markL7 call in consumeHTTPID.
 func (p *pipeline) enqueueRequest(key string, proto api.Protocol, req api.Payload, src, dst api.Endpoint) {
+	p.enqueueRequestOnly(key, proto, req, src, dst)
+
+	// Flag this connection as L7-dissected so the generic L4 flow tracker does
+	// not also emit a redundant flow entry for it.
+	p.markL7(key)
+}
+
+// enqueueRequestOnly is enqueueRequest without the markL7 call — for callers
+// that flag the connection themselves. It must never be called while holding
+// flowMu (markL7 takes flowMu, and flowMu must never nest inside mu).
+func (p *pipeline) enqueueRequestOnly(key string, proto api.Protocol, req api.Payload, src, dst api.Endpoint) {
+	p.appendPending(key, &pendingReq{protocol: proto, req: req, src: src, dst: dst, ts: time.Now(), filled: true})
+}
+
+// reserveRequest enqueues a request whose payload is not complete yet and
+// returns the slot, to be completed with fillRequest.
+//
+// It exists because of a reassembly-ordering hazard that a "wait a moment for
+// the request to show up" retry in completeResponse cannot fix. A
+// tcpreader.ReaderStream releases the assembler as soon as its reader asks for
+// bytes it doesn't have yet, so once an HTTP request body spans more than one
+// reassembly the assembler is free to hand the *response* direction its data
+// while this goroutine is still blocked inside drainBody. The response
+// goroutine then reaches completeResponse first — and the request it is
+// looking for cannot possibly be enqueued until that goroutine returns and
+// lets the assembler feed the request direction again. Enqueueing after the
+// body was read therefore doesn't just race: it drops the response, and any
+// retry there would sleep through a state that provably cannot change.
+// Reserving the slot the moment the request line and headers are parsed closes
+// the window entirely, with no sleeping and no throughput cost.
+func (p *pipeline) reserveRequest(key string, proto api.Protocol, req api.Payload, src, dst api.Endpoint) *pendingReq {
 	pr := &pendingReq{protocol: proto, req: req, src: src, dst: dst, ts: time.Now()}
+	p.appendPending(key, pr)
+	return pr
+}
+
+// fillRequest completes a slot taken by reserveRequest with the fields only
+// knowable once the body has been read, and returns the response that arrived
+// in the meantime, if any — completeResponse already popped the request in that
+// case, so the caller owns pr outright and must emit the pair itself.
+func (p *pipeline) fillRequest(pr *pendingReq, body string, truncated bool, size int, raw *api.RawView) *pendingResp {
+	p.mu.Lock()
+	pr.req.Body = body
+	pr.req.Truncated = truncated
+	pr.req.Size = size
+	pr.req.Raw = raw
+	pr.filled = true
+	resp := pr.resp
+	pr.resp = nil
+	p.mu.Unlock()
+	return resp
+}
+
+// appendPending queues pr on its connection, bounding both the per-connection
+// backlog and the map itself.
+func (p *pipeline) appendPending(key string, pr *pendingReq) {
 	p.mu.Lock()
 	cs := p.conns[key]
 	if cs == nil {
@@ -161,37 +255,73 @@ func (p *pipeline) enqueueRequest(key string, proto api.Protocol, req api.Payloa
 	// PipelineDepth = requests already outstanding ahead of this one. Set through
 	// the shared *RedisDetail pointer under the lock (before the pending request
 	// becomes visible to the response goroutine) so it is race-free.
-	if req.Redis != nil {
-		req.Redis.PipelineDepth = len(cs.reqs)
+	if pr.req.Redis != nil {
+		pr.req.Redis.PipelineDepth = len(cs.reqs)
 	}
 	cs.reqs = append(cs.reqs, pr)
 	if len(cs.reqs) > reqBacklogCap {
 		cs.reqs = cs.reqs[1:] // drop the oldest pending request to bound growth
 	}
+	evictOverCapLocked(p.conns, maxPending, nil)
 	p.mu.Unlock()
-
-	// Flag this connection as L7-dissected so the generic L4 flow tracker does
-	// not also emit a redundant flow entry for it.
-	p.markL7(key)
 }
 
 // completeResponsePairRetries/Delay bound how long completeResponse waits for
-// a request that hasn't been enqueued *yet*. AF_PACKET's request and response
-// goroutines are ordered by real network causality (a response can't arrive
-// before the request that produced it was fully sent), so the pending
-// request is essentially always already there. The eBPF TLS path
-// (tls_pipeline.go) has no such guarantee: consumeTLS feeds both directions
-// back-to-back from in-memory records with no real network delay between
-// them, so its two independently-scheduled per-direction goroutines can
-// legitimately race — completeResponse observed before the matching
-// enqueueRequest — dropping every entry on that connection. This bounded
-// retry (worst case ~8ms) closes that race for both callers at negligible
-// cost to the genuine "capture started mid-connection" case, which still
-// correctly gives up and returns after the budget.
+// a request that hasn't been enqueued *yet*. The eBPF TLS path
+// (tls_pipeline.go) needs it: consumeTLS feeds both directions back-to-back
+// from in-memory records with no real network delay between them, so its two
+// independently-scheduled per-direction goroutines can legitimately race —
+// completeResponse observed before the matching enqueueRequest — dropping
+// every entry on that connection. This bounded retry (worst case ~8ms) closes
+// that race.
+//
+// It is applied ONLY to connections that are not known to be AF_PACKET-fed
+// (see pipeline.afPacketStreams), for two independent reasons.
+//
+// First, waiting there does not work. The one genuine ordering hazard on
+// AF_PACKET — the response direction overtaking a request goroutine that is
+// still reading its body — is a hazard the wait provably cannot resolve, since
+// the request direction is blocked on a reassembler this very goroutine is
+// holding up; that window is closed structurally instead, by reserving the
+// pending slot before the body is read (see reserveRequest).
+//
+// Second, with that window closed, an empty pending queue on AF_PACKET is not
+// a race at all, it is the normal answer — purgePending just dropped
+// everything after a lost segment (see lossReader), capture started
+// mid-connection on a keep-alive (routine at DaemonSet start), the client sent
+// a bare MySQL COM_QUIT, or the request direction is simply not visible from
+// this node. Sleeping 4x2ms on every one of those caps the affected direction
+// at ~125 messages/second, and because the sleeping goroutine is the one
+// draining a tcpassembly ReaderStream, that back-pressure propagates into the
+// reassembler and shows up as page exhaustion and silently truncated streams —
+// a far worse failure than dropping the unpairable response the wait was never
+// going to find anyway.
 const (
 	completeResponsePairRetries = 4
 	completeResponsePairDelay   = 2 * time.Millisecond
 )
+
+// addAFPacketStream / removeAFPacketStream bracket one AF_PACKET stream
+// direction, marking its connection as fed by a capture path whose pending
+// requests are ordered by real network causality (see
+// completeResponsePairRetries). Both directions of a connection register under
+// the same key, hence the refcount: the entry must survive until the last
+// direction's goroutine has exited.
+func (p *pipeline) addAFPacketStream(key string) {
+	p.mu.Lock()
+	p.afPacketStreams[key]++
+	p.mu.Unlock()
+}
+
+func (p *pipeline) removeAFPacketStream(key string) {
+	p.mu.Lock()
+	if n := p.afPacketStreams[key] - 1; n > 0 {
+		p.afPacketStreams[key] = n
+	} else {
+		delete(p.afPacketStreams, key)
+	}
+	p.mu.Unlock()
+}
 
 // peekPendingMethod returns the HTTP method of the oldest pending request on
 // key without consuming it (completeResponse does the actual pop once the
@@ -236,16 +366,41 @@ func (p *pipeline) completeResponse(key string, resp api.Payload, statusCode int
 		if cs != nil && len(cs.reqs) > 0 {
 			pr = cs.reqs[0]
 			cs.reqs = cs.reqs[1:]
+			if !pr.filled {
+				// The request goroutine reserved this slot but is still reading
+				// the body (see reserveRequest), so pr.req isn't complete and
+				// isn't ours to read. Park the response on it instead: that
+				// goroutine emits the pair as soon as fillRequest hands this
+				// back to it. Waiting here would be worse than useless — the
+				// request direction usually cannot make progress until this
+				// goroutine returns to the reassembler.
+				pr.resp = &pendingResp{payload: resp, statusCode: statusCode, status: status, firstByte: firstByteTime}
+				p.mu.Unlock()
+				return
+			}
 			p.mu.Unlock()
 			break
 		}
+		// Nothing pending. Whether that is a race worth waiting out or just an
+		// unpairable response depends on which capture path fed this connection
+		// — read under the same lock we already hold.
+		waitForPair := p.afPacketStreams[key] == 0
 		p.mu.Unlock()
-		if attempt >= completeResponsePairRetries {
+		if !waitForPair || attempt >= completeResponsePairRetries {
 			return // no request to pair with (capture started mid-connection)
 		}
 		time.Sleep(completeResponsePairDelay)
 	}
 
+	p.emitPair(key, pr, resp, statusCode, status, firstByteTime)
+}
+
+// emitPair builds and emits the finished entry for an already-paired
+// request/response. Split out of completeResponse because the pairing can also
+// be resolved on the request goroutine — when the response arrived while the
+// request body was still being read, fillRequest hands it back there (see
+// reserveRequest).
+func (p *pipeline) emitPair(key string, pr *pendingReq, resp api.Payload, statusCode int, status string, firstByteTime time.Time) {
 	if resp.HTTP != nil && !firstByteTime.IsZero() {
 		resp.HTTP.TTFBMs = firstByteTime.Sub(pr.ts).Milliseconds()
 	}
@@ -305,6 +460,11 @@ func (f *tcpStreamFactory) New(netFlow, transport gopacket.Flow) tcpassembly.Str
 func (p *pipeline) consumeStream(netFlow, transport gopacket.Flow, r io.Reader) {
 	c := connIDFromFlows(netFlow, transport)
 	key := c.key()
+	// Registered for as long as this direction is being read: it tells
+	// completeResponse that an empty pending queue on this connection is a real
+	// answer, not the eBPF TLS scheduling race, so it must not sleep on it.
+	p.addAFPacketStream(key)
+	defer p.removeAFPacketStream(key)
 	lr := &lossReader{r: r, onLoss: func() {
 		p.purgePending(key)
 		p.sink.tcpLossEvents.Add(1)
@@ -528,22 +688,44 @@ func (p *pipeline) consumeHTTPID(c connID, r io.Reader) {
 		if err != nil {
 			return
 		}
-		body, truncated, full := p.drainBody(req.Body)
-		body, truncated = decompressBody(body, truncated, req.Header.Get("Content-Encoding"), p.bodyCap)
+		// L7-dissected: don't also emit a generic L4 flow for this conn.
+		//
+		// Deliberately per request, not latched in a local "already flagged"
+		// bool: flushFlows *deletes* an idle flow whatever its l7 flag (the
+		// !f.l7 test there only suppresses the emit, the key is still reaped),
+		// and the idle timeout is 20s while an HTTP keep-alive connection lives
+		// far longer than that (Go's IdleConnTimeout is 90s, nginx's
+		// keepalive_timeout 75s). With a latch, the first request after any 20s
+		// gap would recreate the flowState unflagged and never re-flag it, so
+		// every later idle period — and the eventual FIN — would emit a generic
+		// TCP entry duplicating traffic already reported as HTTP entries, for
+		// the rest of the connection's life. Re-flagging costs one uncontended
+		// flowMu acquisition per request, orders of magnitude less than the
+		// recurring bogus entries it prevents.
+		p.markL7(key)
 		ct := req.Header.Get("Content-Type")
-		p.enqueueRequest(key, api.ProtocolHTTP, api.Payload{
+		// Reserve the pending slot *before* reading the body — see
+		// reserveRequest. Once drainBody has to ask the reassembler for more
+		// bytes, the response direction can overtake this goroutine, and a
+		// response that finds nothing pending is dropped outright.
+		pr := p.reserveRequest(key, api.ProtocolHTTP, api.Payload{
 			Method:      req.Method,
 			Path:        redactedRequestURI(req.URL, p.redactHeaders),
 			Host:        req.Host,
 			Headers:     p.flattenHeaders(req.Header),
-			Body:        safeBody(body),
-			Truncated:   truncated,
-			Size:        full,
 			ContentType: ct,
-			Raw:         rawOf(cr),
 			HTTP:        &api.HTTPDetail{Version: req.Proto, ContentType: ct, Query: parseQuery(req.URL, p.redactHeaders)},
 			Summary:     req.Method + " " + redactedRequestURI(req.URL, p.redactHeaders),
 		}, src, dst)
+		body, truncated, full := p.drainBody(req.Body)
+		body, truncated = decompressBody(body, truncated, req.Header.Get("Content-Encoding"), p.bodyCap)
+		// rawOf is read here rather than at reserve time so the Raw view still
+		// covers the body bytes the tee saw while draining.
+		if resp := p.fillRequest(pr, safeBody(body), truncated, full, rawOf(cr)); resp != nil {
+			// The response beat us to it and was parked on the pending request;
+			// completeResponse already popped it, so emitting is now our job.
+			p.emitPair(key, pr, resp.payload, resp.statusCode, resp.status, resp.firstByte)
+		}
 		if isWebSocketUpgradeRequest(req) {
 			// The client asked to switch protocols. Its half of the connection
 			// carries WebSocket frames from here on (the server's 101 is seen
@@ -813,6 +995,7 @@ func (p *pipeline) dnsQuery(client, server api.Endpoint, dns *layers.DNS, raw []
 		ts:        time.Now(),
 		raw:       rawViewFromBytes(raw, p.rawCap),
 	}
+	evictOverCapLocked(p.dns, maxPending, nil)
 	p.mu.Unlock()
 }
 
@@ -914,43 +1097,131 @@ func (p *pipeline) consumeDNSTCPID(c connID, r io.Reader, isRequest bool) {
 	}
 }
 
+// gcDeleteBatch bounds how many keys one sweep (gc here, flushFlows in
+// dissect_l4.go) deletes per lock acquisition. Both run on a 15s ticker over
+// maps that can hold tens of thousands of entries, and the packet path —
+// enqueueRequest, completeResponse, dnsQuery, trackTCP — blocks on those very
+// same mutexes. Holding one across a whole sweep stalls capture for as long as
+// the sweep takes, which at cap is milliseconds and is enough to back
+// tcpassembly up into page exhaustion. Collecting the victims first and then
+// deleting them in batches, releasing the lock in between, bounds any single
+// stall to one batch.
+const gcDeleteBatch = 512
+
+// maxPending bounds each of the pending-pairing maps (p.conns, p.dns, p.mongo,
+// p.kafka) the way maxFlows bounds p.flows: gc only reaps by
+// timestamp every 15s, so without a cap a burst of connections — or a capture
+// that only ever sees requests — can grow them without limit in between
+// cycles. A var (not a const) only so tests can shrink it.
+var maxPending = 100000
+
+// sweepStale removes every entry of m for which expired reports true, without
+// ever holding mu for the whole map. The scan does need the lock (iterating a
+// map while another goroutine writes it is a fatal error), but the deletions
+// are batched — see gcDeleteBatch.
+//
+// expired is re-evaluated per key at delete time, and that re-check is what
+// makes releasing the lock safe: between the scan and the delete the entry may
+// have been refreshed, or the key reused by a brand-new connection, and
+// neither must be reaped.
+func sweepStale[V any](mu *sync.Mutex, m map[string]V, expired func(V) bool) {
+	mu.Lock()
+	var stale []string
+	for k, v := range m {
+		if expired(v) {
+			stale = append(stale, k)
+		}
+	}
+	mu.Unlock()
+
+	for i := 0; i < len(stale); i += gcDeleteBatch {
+		end := i + gcDeleteBatch
+		if end > len(stale) {
+			end = len(stale)
+		}
+		mu.Lock()
+		for _, k := range stale[i:end] {
+			if v, ok := m[k]; ok && expired(v) {
+				delete(m, k)
+			}
+		}
+		mu.Unlock()
+	}
+}
+
+// trimOverCap drops arbitrary entries from m, in batches, until it is back
+// within cap. Used for the pending maps whose insert sites live in dissectors
+// that don't cap them at insert time; the timestamp sweep above is the primary
+// reclaim, this is only the ceiling that keeps a 15s burst bounded.
+func trimOverCap[V any](mu *sync.Mutex, m map[string]V, cap int) {
+	for {
+		mu.Lock()
+		for n := 0; n < gcDeleteBatch && len(m) > cap; n++ {
+			for k := range m {
+				delete(m, k)
+				break
+			}
+		}
+		over := len(m) > cap
+		mu.Unlock()
+		if !over {
+			return
+		}
+	}
+}
+
 // gc drops stale pending state so a lossy capture can't leak memory.
 func (p *pipeline) gc() {
 	cutoff := time.Now().Add(-30 * time.Second)
+	sweepStale(&p.mu, p.dns, func(d *dnsPending) bool { return d.ts.Before(cutoff) })
+	sweepStale(&p.mu, p.mongo, func(m *mongoPending) bool { return m.ts.Before(cutoff) })
+	sweepStale(&p.mu, p.kafka, func(m *kafkaPending) bool { return m.ts.Before(cutoff) })
+
+	// p.conns is a prune, not a plain delete: expired pending requests are
+	// dropped and the connection removed only once nothing is left. reqs is
+	// append-ordered by ts, so a fresh reqs[0] means none of them are expired
+	// and the connection needn't be visited at all.
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for k, d := range p.dns {
-		if d.ts.Before(cutoff) {
-			delete(p.dns, k)
-		}
-	}
-	for k, m := range p.mongo {
-		if m.ts.Before(cutoff) {
-			delete(p.mongo, k)
-		}
-	}
-	for k, m := range p.kafka {
-		if m.ts.Before(cutoff) {
-			delete(p.kafka, k)
-		}
-	}
+	var stale []string
 	for k, cs := range p.conns {
-		kept := cs.reqs[:0]
-		for _, r := range cs.reqs {
-			if !r.ts.Before(cutoff) {
-				kept = append(kept, r)
+		if len(cs.reqs) == 0 || cs.reqs[0].ts.Before(cutoff) {
+			stale = append(stale, k)
+		}
+	}
+	p.mu.Unlock()
+	for i := 0; i < len(stale); i += gcDeleteBatch {
+		end := i + gcDeleteBatch
+		if end > len(stale) {
+			end = len(stale)
+		}
+		p.mu.Lock()
+		for _, k := range stale[i:end] {
+			cs := p.conns[k]
+			if cs == nil {
+				continue
+			}
+			// Re-filter from scratch: the lock was released between batches, so
+			// fresh requests may have been appended since the scan.
+			kept := cs.reqs[:0]
+			for _, r := range cs.reqs {
+				if !r.ts.Before(cutoff) {
+					kept = append(kept, r)
+				}
+			}
+			cs.reqs = kept
+			if len(cs.reqs) == 0 {
+				delete(p.conns, k)
 			}
 		}
-		cs.reqs = kept
-		if len(cs.reqs) == 0 {
-			delete(p.conns, k)
-		}
+		p.mu.Unlock()
 	}
-	for k, r := range p.redisDB {
-		if r.ts.Before(cutoff) {
-			delete(p.redisDB, k)
-		}
-	}
+
+	// Capacity ceilings. p.conns and p.dns are also capped at insert time
+	// (enqueueRequestOnly / dnsQuery, both here in pipeline.go); p.mongo,
+	// and p.kafka are only inserted into from the dissectors, so this 15s trim
+	// is their only bound for now.
+	trimOverCap(&p.mu, p.mongo, maxPending)
+	trimOverCap(&p.mu, p.kafka, maxPending)
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -1026,15 +1297,15 @@ func decompressBody(body string, truncated bool, contentEncoding string, limit i
 	var zr io.Reader
 	switch strings.ToLower(strings.TrimSpace(contentEncoding)) {
 	case "gzip":
-		gr, err := gzip.NewReader(strings.NewReader(body))
+		gr, err := acquireGzipReader(strings.NewReader(body))
 		if err != nil {
 			return body, truncated
 		}
-		defer gr.Close()
+		defer releaseGzipReader(gr)
 		zr = gr
 	case "deflate":
-		fr := flate.NewReader(strings.NewReader(body))
-		defer fr.Close()
+		fr := acquireFlateReader(strings.NewReader(body))
+		defer releaseFlateReader(fr)
 		zr = fr
 	default:
 		return body, truncated
@@ -1053,6 +1324,66 @@ func decompressBody(body string, truncated bool, contentEncoding string, limit i
 	return decompressed, truncated
 }
 
+// gzipReaderPool / flateReaderPool recycle the decompressors decompressBody
+// uses. A fresh gzip.Reader (and the flate decompressor inside it) carries a
+// ~32 KiB sliding-window dictionary plus Huffman tables — on the order of 57 KB
+// of fresh garbage for every compressed HTTP response, and compressed is the
+// norm for real APIs.
+//
+// Reuse is safe regardless of how the previous user left the reader: both
+// Reset implementations reinitialise the decompressor's whole state (window,
+// tables, error, step) before touching the new input, so a reader abandoned
+// mid-stream — which is exactly what the zip-bomb guard below does, since
+// io.CopyN(limit+1) stops without draining — is indistinguishable from a fresh
+// one after Reset. Nothing may be read from a pooled reader before Reset.
+var (
+	gzipReaderPool  sync.Pool // *gzip.Reader
+	flateReaderPool sync.Pool // io.ReadCloser, also a flate.Resetter
+)
+
+// acquireGzipReader returns a gzip reader positioned on r, recycled when
+// possible. An error means the body isn't valid gzip after all; the reader is
+// still returned to the pool (a failed Reset leaves it reusable — Reset clears
+// the state before it parses the header).
+func acquireGzipReader(r io.Reader) (*gzip.Reader, error) {
+	gr, _ := gzipReaderPool.Get().(*gzip.Reader)
+	if gr == nil {
+		return gzip.NewReader(r)
+	}
+	if err := gr.Reset(r); err != nil {
+		gzipReaderPool.Put(gr)
+		return nil, err
+	}
+	return gr, nil
+}
+
+func releaseGzipReader(gr *gzip.Reader) {
+	_ = gr.Close() // no-op for resources, but keep the original Close-before-reuse
+	gzipReaderPool.Put(gr)
+}
+
+// acquireFlateReader returns a flate reader positioned on r, recycled when
+// possible. flate's Resetter never fails in practice (no header to parse, and
+// a nil dictionary is always valid), but a reader we could not reset is
+// discarded rather than reused.
+func acquireFlateReader(r io.Reader) io.ReadCloser {
+	fr, _ := flateReaderPool.Get().(io.ReadCloser)
+	if fr == nil {
+		return flate.NewReader(r)
+	}
+	if rs, ok := fr.(flate.Resetter); ok {
+		if err := rs.Reset(r, nil); err == nil {
+			return fr
+		}
+	}
+	return flate.NewReader(r)
+}
+
+func releaseFlateReader(fr io.ReadCloser) {
+	fr.Close()
+	flateReaderPool.Put(fr)
+}
+
 // safeBody replaces a non-printable body with a bounded hex preview plus its
 // true byte length, instead of storing raw bytes that would corrupt JSON/UI
 // rendering. Printable UTF-8 passes through unchanged. Applies to HTTP and
@@ -1067,11 +1398,22 @@ func safeBody(s string) string {
 
 // capReader tees up to max bytes into buf while passing every read through. It
 // records the first "connection head" bytes of one direction for the Raw view.
+//
+// One capReader is owned by exactly one dissector goroutine (see
+// pipeline.capture — it is created per direction inside consumeHTTPID and
+// friends and never published), so the memo fields below need no locking.
 type capReader struct {
 	r     io.Reader
 	buf   []byte
 	total int
 	max   int
+
+	// cachedData memoises the captured sample, keyed by cachedLen. On a
+	// keep-alive connection raw() is called once per emitted entry but returns
+	// the very same connection-head bytes every time, so without this the
+	// snapshot is rebuilt per entry for the life of the connection.
+	cachedData []byte
+	cachedLen  int
 }
 
 func newCapReader(r io.Reader, max int) *capReader {
@@ -1097,8 +1439,29 @@ func (c *capReader) raw() *api.RawView {
 	if len(c.buf) == 0 {
 		return nil
 	}
+	// Reuse the previous snapshot whenever buf hasn't changed. That test can be
+	// a length comparison because Read only ever *appends* to buf and stops
+	// appending for good once len(buf) reaches max — buf is append-only and
+	// then frozen, so an unchanged length means byte-for-byte unchanged
+	// content.
+	//
+	// The snapshot is a copy rather than c.buf itself: the entry outlives this
+	// call and is marshaled later (see sink.assembleBatch), while c.buf keeps
+	// being appended to until it freezes at max. Sharing the slice would be
+	// *almost* safe — append writes past len, so the bytes an entry can see
+	// never change — but it would alias capture state into shipped entries for
+	// no gain, since one copy per growth step is amortised across every entry
+	// the connection produces.
+	if c.cachedLen != len(c.buf) {
+		c.cachedData = append([]byte(nil), c.buf...)
+		c.cachedLen = len(c.buf)
+	}
+	// Only Data is memoised: c.total keeps counting every byte read long after
+	// buf has frozen at max, so Bytes and Truncated must be recomputed on every
+	// call. Returning a cached *RawView wholesale would freeze the byte count of
+	// a long-lived connection at whatever it was on the first entry.
 	return &api.RawView{
-		Hex:       hexDump(c.buf, c.max),
+		Data:      c.cachedData,
 		Bytes:     c.total,
 		Truncated: c.total > len(c.buf),
 	}
@@ -1134,8 +1497,10 @@ func rawViewFromBytes(b []byte, cap int) *api.RawView {
 	if limit > cap {
 		limit = cap
 	}
+	// Copy: b is typically a packet buffer the capture layer reuses, so the
+	// entry must not keep a window onto it.
 	return &api.RawView{
-		Hex:       hexDump(b[:limit], limit),
+		Data:      append([]byte(nil), b[:limit]...),
 		Bytes:     len(b),
 		Truncated: len(b) > limit,
 	}

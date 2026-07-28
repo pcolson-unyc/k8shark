@@ -186,6 +186,16 @@ const (
 	// facetTopN is how many top values (by count) are surfaced per field in
 	// the /api/fields bulk snapshot.
 	facetTopN = 50
+	// facetEvictSample is how many keys the at-cap eviction looks at before
+	// dropping the least-seen of them. Go randomises map iteration order, so
+	// the first k keys are a free random sample — no reservoir bookkeeping, no
+	// extra state. Scanning all facetTrackCap keys instead (the previous
+	// behaviour) ran on *every* value of a saturated high-cardinality field
+	// (src.ip, pod names), i.e. thousands of times a second under one
+	// process-wide mutex; a sample keeps the counter at cap for the same cost
+	// as a handful of map probes. Still space-saving in spirit, and as before
+	// not a strict guarantee about which key goes.
+	facetEvictSample = 8
 )
 
 // fieldCounter holds observed value counts for a single tracked field. It has
@@ -199,24 +209,76 @@ type fieldCounter struct {
 }
 
 // increment bumps v's count. If v is a brand new key and the counter is
-// already at facetTrackCap distinct values, the single lowest-count entry is
-// evicted first (linear scan -- fine at this scale; this is space-saving in
-// spirit, not a strict guarantee). Caller holds facetIndex.mu.
+// already at facetTrackCap distinct values, the lowest-count key of a random
+// facetEvictSample-sized sample is evicted first, keeping the counter at cap
+// (see facetEvictSample -- space-saving in spirit, not a strict guarantee).
+// Caller holds facetIndex.mu.
 func (fc *fieldCounter) increment(v string) {
 	if _, exists := fc.counts[v]; !exists && len(fc.counts) >= facetTrackCap {
 		var evictKey string
-		found := false
 		var evictCount int64
+		seen := 0
 		for k, c := range fc.counts {
-			if !found || c < evictCount {
-				evictKey, evictCount, found = k, c, true
+			if seen == 0 || c < evictCount {
+				evictKey, evictCount = k, c
+			}
+			seen++
+			if seen == facetEvictSample {
+				break
 			}
 		}
-		if found {
+		if seen > 0 {
 			delete(fc.counts, evictKey)
 		}
 	}
 	fc.counts[v]++
+}
+
+// facetGate groups tracked fields that all read through the same nil-guarded
+// sub-object, with the one presence test that decides whether any of them can
+// possibly yield a value. observe() runs per ingested entry, and the great
+// majority of the ~50 tracked fields belong to a protocol the entry isn't:
+// checking `e.Request.Redis != nil` once skips every redis getter in one
+// branch instead of calling each to have it return "".
+//
+// Gating on the sub-object pointer rather than on e.Protocol is deliberate:
+// the counts must come out *identical* to calling every getter, and only the
+// nil guard proves that. Protocol is not a safe proxy — several tracked fields
+// read shared Payload members that more than one dissector fills (http.method
+// is also an AMQP entry's "Publish"/"Consume", via Request.Method), so keying
+// off e.Protocol would silently change what /api/fields reports.
+type facetGate struct {
+	present func(*api.Entry) bool
+	fields  []string
+}
+
+// facetGates lists every tracked catalog field whose getter is guarded by a
+// sub-object pointer, grouped by that pointer. Fields absent from this list are
+// evaluated for every entry (they read plain Payload/Endpoint members, which
+// any protocol may carry). Keep it in sync with fieldGetter: a field listed
+// here whose getter no longer nil-guards on the same pointer would under-count
+// -- TestFacetGatesMatchGetters pins that.
+var facetGates = []facetGate{
+	{func(e *api.Entry) bool { return e.Request.HTTP != nil }, []string{"http.version"}},
+	{func(e *api.Entry) bool { return e.Request.DNS != nil }, []string{"dns.type"}},
+	{func(e *api.Entry) bool { return e.Response.DNS != nil }, []string{"dns.rcode", "dns.authoritative", "dns.recursionavailable"}},
+	{func(e *api.Entry) bool { return e.Request.Redis != nil }, []string{"redis.db", "redis.pipelinedepth"}},
+	{func(e *api.Entry) bool { return e.Request.Postgres != nil }, []string{"postgres.statement", "postgres.portal"}},
+	{func(e *api.Entry) bool { return e.Response.Postgres != nil }, []string{"postgres.error", "postgres.txstatus"}},
+	{func(e *api.Entry) bool { return e.Request.MySQL != nil }, []string{"mysql.command"}},
+	{func(e *api.Entry) bool { return e.Response.MySQL != nil }, []string{"mysql.error"}},
+	{func(e *api.Entry) bool { return e.Request.Mongo != nil }, []string{"mongo.collection", "mongo.command"}},
+	{func(e *api.Entry) bool { return e.Request.Kafka != nil }, []string{"kafka.topic", "kafka.apikey"}},
+	{func(e *api.Entry) bool { return e.L4 != nil }, []string{
+		"l4.ttl", "l4.mss", "l4.ipversion", "l4.ipflags", "l4.clienttcpflags", "l4.servertcpflags", "tls.sni",
+	}},
+}
+
+// facetGroup is a compiled facetGate: the presence test plus the counters it
+// guards, resolved once at construction.
+type facetGroup struct {
+	present  func(*api.Entry) bool
+	counters []*fieldCounter
 }
 
 // facetIndex tracks observed values per field, for IFL autocomplete. It owns
@@ -224,6 +286,14 @@ func (fc *fieldCounter) increment(v string) {
 type facetIndex struct {
 	mu     sync.Mutex
 	fields map[string]*fieldCounter // canonical field name -> counter (TrackValues fields only)
+
+	// ungated/groups are the ingest-path view of fields: a flat slice (ranging
+	// a map re-hashes every bucket per entry, and observe() runs on every one)
+	// split into the counters every entry must be checked against and the
+	// sub-object-gated groups (see facetGate). Both hold the same *fieldCounter
+	// pointers the fields map does -- one counter, two indexes.
+	ungated []*fieldCounter
+	groups  []facetGroup
 
 	// requestHeaderNames/responseHeaderNames track distinct HTTP header keys
 	// observed on each side, powering request.header.<name>/
@@ -255,23 +325,62 @@ func newFacetIndex() *facetIndex {
 		}
 		f.fields[spec.Name] = &fieldCounter{get: get, counts: map[string]int64{}}
 	}
+
+	// Split the counters into the ingest-path views. A field named by a gate but
+	// missing from fields (untracked or dropped by the drift guard above) is
+	// simply skipped, so a stale gate entry can never resurrect a counter.
+	gated := make(map[string]bool, len(facetGates))
+	for _, g := range facetGates {
+		grp := facetGroup{present: g.present}
+		for _, name := range g.fields {
+			fc, ok := f.fields[name]
+			if !ok {
+				continue
+			}
+			gated[name] = true
+			grp.counters = append(grp.counters, fc)
+		}
+		if len(grp.counters) > 0 {
+			f.groups = append(f.groups, grp)
+		}
+	}
+	// Catalog order, so the ingest path walks the counters deterministically.
+	for _, spec := range fieldCatalog {
+		if fc, ok := f.fields[spec.Name]; ok && !gated[spec.Name] {
+			f.ungated = append(f.ungated, fc)
+		}
+	}
 	return f
 }
 
 // observe records one entry's tracked field values, using each counter's
 // getter resolved once at construction (see newFacetIndex) -- no duplicated
 // field-accessor logic and no per-entry, per-field lookup into filter.go's
-// fieldGetter switch. It also records any HTTP header keys present, for
-// headerFieldNames.
+// fieldGetter switch. Protocol-specific counters are reached through their
+// sub-object gate (see facetGate) so an entry only pays for the getters that
+// can yield anything; the recorded counts are the same either way. It also
+// records any HTTP header keys present, for headerFieldNames.
 func (f *facetIndex) observe(e *api.Entry) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, fc := range f.fields {
+	for _, fc := range f.ungated {
 		v := fc.get(e)
 		if v == "" {
 			continue
 		}
 		fc.increment(v)
+	}
+	for _, g := range f.groups {
+		if !g.present(e) {
+			continue
+		}
+		for _, fc := range g.counters {
+			v := fc.get(e)
+			if v == "" {
+				continue
+			}
+			fc.increment(v)
+		}
 	}
 	for name := range e.Request.Headers {
 		f.requestHeaderNames.increment(name)

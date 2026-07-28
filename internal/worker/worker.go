@@ -365,7 +365,7 @@ func (p *pipeline) route(assembler *tcpassembly.Assembler, pkt gopacket.Packet) 
 
 	if tl := pkt.Layer(layers.LayerTypeTCP); tl != nil {
 		tcp, _ := tl.(*layers.TCP)
-		meta := extractL4Meta(pkt, p.headerHexCap)
+		meta := extractL4Meta(pkt)
 		assembler.AssembleWithTimestamp(net.NetworkFlow(), tcp, ts)
 		p.trackTCP(net.NetworkFlow(), tcp.TransportFlow(), tcp, length, ts, meta)
 		return
@@ -394,41 +394,111 @@ func (p *pipeline) route(assembler *tcpassembly.Assembler, pkt gopacket.Packet) 
 // l4meta is the per-packet L3/L4 header data trackTCP needs to build L4Info.
 // It is extracted in route() while the raw packet layers are still available
 // (the reassembled L7 stream the dissectors see has already lost them).
+//
+// It deliberately carries the *unrendered* header bytes rather than a finished
+// hexdump, and leaves the MAC / fragment-flag strings unformatted. Every one of
+// those values is copied into the flow exactly once (trackTCP's `if f.X == ""`
+// guards) and is dropped entirely for a packet the CAP-8 dedup rejects — but
+// extractL4Meta runs for *every* TCP packet, so formatting them here meant
+// rendering a hexdump and three strings per packet to keep one per flow.
+// Rendering now happens inside those guards instead (see renderHeaderHex).
+//
+// eth/ip4/ip6/tcp point into the capture buffer's packet data and are only
+// valid for the duration of the route() call that produced them. That is safe
+// because route() hands the l4meta straight to trackTCP, which renders
+// everything it needs synchronously and retains none of the slices — the same
+// contract route() already relies on when it passes *layers.TCP through.
 type l4meta struct {
-	srcMAC, dstMAC string
-	ipVersion      int
-	ttl            int
-	ipFlags        string
-	headerHex      string // bounded hexdump of eth+ip+tcp header bytes
+	eth       *layers.Ethernet
+	ip4       *layers.IPv4
+	ip6       *layers.IPv6
+	tcp       *layers.TCP
+	ipVersion int
+	ttl       int
 }
 
-// extractL4Meta reads the Ethernet/IP header fields from a packet and builds a
-// bounded header hexdump (capped at capBytes; <=0 skips the dump).
-func extractL4Meta(pkt gopacket.Packet, capBytes int) l4meta {
+// extractL4Meta picks the Ethernet/IP/TCP layers out of a packet and reads the
+// two cheap scalar fields (IP version, TTL). Everything string-shaped is left
+// to trackTCP — see the l4meta doc comment.
+func extractL4Meta(pkt gopacket.Packet) l4meta {
 	var m l4meta
-	var hdr []byte
 	if eth, ok := pkt.Layer(layers.LayerTypeEthernet).(*layers.Ethernet); ok {
-		m.srcMAC = eth.SrcMAC.String()
-		m.dstMAC = eth.DstMAC.String()
-		hdr = append(hdr, eth.LayerContents()...)
+		m.eth = eth
 	}
 	if ip4, ok := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4); ok {
+		m.ip4 = ip4
 		m.ipVersion = 4
 		m.ttl = int(ip4.TTL)
-		m.ipFlags = ipv4Flags(ip4.Flags)
-		hdr = append(hdr, ip4.LayerContents()...)
 	} else if ip6, ok := pkt.Layer(layers.LayerTypeIPv6).(*layers.IPv6); ok {
+		m.ip6 = ip6
 		m.ipVersion = 6
 		m.ttl = int(ip6.HopLimit)
-		hdr = append(hdr, ip6.LayerContents()...)
 	}
 	if tcp, ok := pkt.Layer(layers.LayerTypeTCP).(*layers.TCP); ok {
-		hdr = append(hdr, tcp.LayerContents()...)
-	}
-	if capBytes > 0 && len(hdr) > 0 {
-		m.headerHex = hexDump(hdr, capBytes)
+		m.tcp = tcp
 	}
 	return m
+}
+
+// macStrings renders the Ethernet source/destination MACs, or ("", "") when the
+// packet had no Ethernet layer (e.g. a raw-IP capture interface).
+func (m l4meta) macStrings() (src, dst string) {
+	if m.eth == nil {
+		return "", ""
+	}
+	return m.eth.SrcMAC.String(), m.eth.DstMAC.String()
+}
+
+// ipFlagStr renders the IPv4 DF/MF fragment flags ("" for IPv6 or no IP layer,
+// matching what the old eager extraction stored).
+func (m l4meta) ipFlagStr() string {
+	if m.ip4 == nil {
+		return ""
+	}
+	return ipv4Flags(m.ip4.Flags)
+}
+
+// renderHeaderHex builds the bounded eth+ip+tcp header hexdump, capped at
+// capBytes (<=0 or no header layers => ""). This is the expensive half of the
+// old extractL4Meta and is now called once per flow, from trackTCP, instead of
+// once per packet. The concatenation buffer is sized to what will actually be
+// dumped so the cap bounds the allocation too.
+func (m l4meta) renderHeaderHex(capBytes int) string {
+	if capBytes <= 0 {
+		return ""
+	}
+	var parts [3][]byte
+	if m.eth != nil {
+		parts[0] = m.eth.LayerContents()
+	}
+	switch {
+	case m.ip4 != nil:
+		parts[1] = m.ip4.LayerContents()
+	case m.ip6 != nil:
+		parts[1] = m.ip6.LayerContents()
+	}
+	if m.tcp != nil {
+		parts[2] = m.tcp.LayerContents()
+	}
+	total := len(parts[0]) + len(parts[1]) + len(parts[2])
+	if total == 0 {
+		return ""
+	}
+	if total > capBytes {
+		total = capBytes
+	}
+	hdr := make([]byte, 0, total)
+	for _, part := range parts {
+		room := total - len(hdr)
+		if room <= 0 {
+			break
+		}
+		if len(part) > room {
+			part = part[:room]
+		}
+		hdr = append(hdr, part...)
+	}
+	return hexDump(hdr, capBytes)
 }
 
 // ipv4Flags renders the DF/MF fragment flags.

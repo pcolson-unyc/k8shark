@@ -4,6 +4,24 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # gzip: the load-bearing case is the /api/ proxy, not the static bundle —
+    # /api/entries?limit=1000 is ~20 MB of extremely repetitive JSON (the same
+    # field names and endpoint/pod strings on every entry), which compresses by
+    # more than an order of magnitude. gzip_proxied any is what actually turns
+    # it on for proxied responses; without it nginx skips anything coming back
+    # from proxy_pass. gzip_vary keeps shared caches from serving a gzipped body
+    # to a client that didn't ask for one.
+    #
+    # gzip_comp_level is deliberately left at nginx's default of 1: the front
+    # pod requests only 50m CPU (see front.resources in helm/k8shark/values.yaml)
+    # so it has no headroom to spend on the ~2x CPU that level 5-6 costs, and on
+    # JSON this repetitive level 1 already gets most of the available ratio.
+    gzip on;
+    gzip_proxied any;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types application/json text/css application/javascript image/svg+xml text/plain;
+
     # REST API -> hub. HUB_TOKEN carries the optional hub API token (empty
     # when auth is off; the hub ignores the header then). Host must be
     # $http_host, not $host: nginx's $host silently drops the port, but the
@@ -18,6 +36,9 @@ server {
 
     # WebSocket stream -> hub
     location /ws {
+        # No gzip here: this is a long-lived upgraded connection, and buffering
+        # frames into the compressor is exactly what a live stream must not do.
+        gzip off;
         proxy_pass ${HUB_SCHEME}://${HUB_HOST}:${HUB_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
@@ -25,6 +46,29 @@ server {
         proxy_set_header Host $http_host;
         proxy_set_header Authorization "Bearer ${HUB_TOKEN}";
         proxy_read_timeout 3600s;
+    }
+
+    # Vite emits content-hashed bundles under /assets/ (app.<hash>.js|css), so a
+    # given URL's bytes never change — a new release means new filenames, not new
+    # content at the same name. Cache them permanently in the browser; the only
+    # request a returning user then pays for is index.html. (`expires` emits the
+    # max-age itself, the add_header appends public/immutable alongside it —
+    # clients join the two Cache-Control headers, which is what we want.)
+    location ^~ /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+        try_files $uri =404;
+    }
+
+    # index.html is the one file whose URL is stable across releases, and it is
+    # what points at the hashed assets — cache it and an upgraded pod keeps
+    # serving the old bundle references. `expires -1` emits both a past Expires
+    # and Cache-Control: no-cache (no add_header needed, which would duplicate
+    # the header). The SPA fallback below internally redirects to /index.html,
+    # which re-runs location matching, so deep links land here too.
+    location = /index.html {
+        expires -1;
     }
 
     # SPA fallback

@@ -55,6 +55,17 @@ export interface L4Info {
 }
 
 export interface RawView {
+  /**
+   * Captured bytes, base64-encoded. What current workers send: base64 costs
+   * 1.33x the bytes it carries, against 4.94x for the pre-rendered `hex` block
+   * below, and the dump is rendered in the browser for the one open entry
+   * instead of for every entry on the wire.
+   */
+  data?: string;
+  /**
+   * Legacy pre-rendered `hexdump -C` block, still sent by a worker older than
+   * its hub. Every consumer reads `data` first and falls back to parsing this.
+   */
   hex?: string;
   bytes?: number;
   truncated?: boolean;

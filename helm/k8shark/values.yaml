@@ -38,7 +38,22 @@ hub:
   replicas: 1
   # bufferSize: how many recent entries the hub keeps in memory (0 = built-in
   # default, 10000). At 1k entries/s the default is only ~10s of history —
-  # raise it (with the memory limit) when debugging busy clusters.
+  # raise it when debugging busy clusters.
+  #
+  # COUPLED TO hub.resources.limits.memory — raise BOTH or neither.
+  # The ring buffer is the bulk of the hub's live heap, and the chart now
+  # derives GOMEMLIMIT from the memory limit (see below). GOMEMLIMIT is a *soft*
+  # ceiling: when the live heap genuinely cannot fit under it, the GC does not
+  # give up and let the kernel OOMKill the pod — it keeps collecting, harder and
+  # harder, until it hits the runtime's 50%-CPU limiter. So an over-large
+  # bufferSize no longer buys you the old clean OOMKill + restart; it buys a hub
+  # that stays "up", burns half a core on GC and serves everything slowly.
+  # Rule of thumb, using the per-entry figure computed under limits.memory below
+  # (~15 KB with the shipped capture caps):
+  #     bytes/entry × bufferSize × 2 (the store's JSON mirror) ≪ limits.memory
+  # e.g. bufferSize 50000 → 15 KB × 50000 × 2 ≈ 1.5 GB of live heap, so it needs
+  # limits.memory around 3Gi, not the default 1Gi. Lowering worker.capture
+  # .bodyBytes/.rawBytes shrinks bytes/entry and buys buffer depth for free.
   bufferSize: 0
   # apiToken: when set, /api and the WebSocket endpoints require
   # `Authorization: Bearer <token>` (browser WebSockets can use a
@@ -84,7 +99,35 @@ hub:
       cpu: 100m
       memory: 128Mi
     limits:
-      memory: 512Mi
+      # 1Gi, not the old 512Mi. Per-entry cost with the caps this chart ships:
+      #   bodies      4096 B × 2 directions                        =  8 KB
+      #   raw view    512 B × 2 (hex, 2 chars/byte) × 2 directions =  2 KB
+      #   endpoints, headers, timings, JSON envelope               = ~5 KB
+      #                                                             ~15 KB
+      # The hub keeps hub.bufferSize entries (default 10000) *and* mirrors each
+      # one's marshaled JSON in a parallel slice (internal/hub/store.go), so a
+      # full buffer is ~15 KB × 10000 × 2 ≈ 300 MB of live heap on its own —
+      # before the fan-out/export queues and the spans Go hasn't returned to the
+      # OS. 512Mi OOMKilled the hub as soon as the buffer filled.
+      #
+      # (This used to read ~21 KB/entry ≈ 410 MB; that assumed the binary's
+      # 2048 B raw view, which worker.capture.rawBytes below now trims to 512.)
+      # 1Gi is therefore headroom rather than a tight fit at the defaults — kept
+      # deliberately so, because the GOMEMLIMIT derived below turns "too small"
+      # into a GC death-spiral instead of a clean restart, and because raising
+      # rawBytes/bodyBytes for a debugging session must not require re-sizing
+      # the pod. Raise it together with bufferSize (see the note there).
+      #
+      # The chart also derives GOMEMLIMIT from this value (80% of it, see
+      # k8shark.hubGoMemLimit in templates/_helpers.tpl) so the GC gets more
+      # aggressive as the heap approaches the cgroup ceiling instead of the
+      # kernel killing the pod. It is computed from the value below rather than
+      # read through the downward API on purpose: a resourceFieldRef on
+      # limits.memory silently falls back to the *node's* allocatable memory
+      # when the container has no limit, which would hand an unlimited hub a
+      # GOMEMLIMIT of the whole node. Templating it means "no limit set" (and
+      # likewise a nonsensical limit of 0) simply renders no GOMEMLIMIT at all.
+      memory: 1Gi
   # export: optional continuous export of every captured entry to an external
   # system, tapping the hub's fan-out (distinct from in-memory retention). Both
   # backends are opt-in and non-blocking — a full buffer drops entries and
@@ -145,12 +188,34 @@ worker:
   # (see internal/worker/capture/bpf.go), without which it's silently dropped
   # before the worker ever sees it.
   httpPorts: []
-  # capture: per-direction extraction depth bounds. Defaults preserve the built-in
-  # behaviour (bodies captured, 4096 B body cap, 2048 B raw hex cap).
+  # capture: per-direction extraction depth bounds. Bodies are captured with the
+  # built-in 4096 B cap; the raw hex view is trimmed below (see rawBytes).
   capture:
     captureBodies: true # set false to omit request/response bodies entirely
     bodyBytes: 0        # 0 = default 4096; max body bytes per direction
-    rawBytes: 0         # 0 = default 2048; <0 disables the raw hex view
+    # rawBytes: max raw bytes hex-dumped per direction. The chart ships 512
+    # rather than the binary's 2048 default because the raw view is stored and
+    # shipped as hex — 2 chars per byte — so 2048 B/direction costs ~8 KB of
+    # extra JSON per entry over the worker→hub→browser path *and* ~8 KB per
+    # retained entry in the hub ring buffer (~80 MB at the default 10000
+    # entries, doubled by the store's JSON mirror), for bytes almost nobody
+    # scrolls past. 512 still saves ~6 KB/entry versus 2048.
+    #
+    # Do not lower this casually: it also bounds pcap-export fidelity.
+    # GET /api/pcap (internal/hub/pcap.go) and the browser-side exporter
+    # (ui/src/pcap.ts) synthesize each frame's payload from the raw view or the
+    # decoded body, whichever is longer — so for entries whose raw view is the
+    # only payload carried, this value *is* the exported packet length:
+    #   - DNS: a classic UDP DNS message runs to 512 B (DNSSEC, multi-answer,
+    #     EDNS); truncating below that yields a frame Wireshark parses as a
+    #     malformed DNS message, not a short one.
+    #   - generic L4 flows (internal/worker/dissect_l4.go) carry a raw view and
+    #     no body at all, so there is nothing to fall back to.
+    # 512 is picked to carry a whole 512 B DNS message and a useful L4 sample.
+    # Raise it when you're actually debugging wire format; 0 = the binary
+    # default 2048; <0 disables the raw hex view entirely (and with it the
+    # payload of any pcap-exported entry that has no body).
+    rawBytes: 512
     # redactHeaders: scrub credential-bearing HTTP header values
     # (authorization, cookie, x-api-key, ...), sensitive query params (token,
     # api_key, ...) and RESP auth command args (AUTH, HELLO, CONFIG SET

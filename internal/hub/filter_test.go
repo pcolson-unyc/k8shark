@@ -752,6 +752,167 @@ func TestInOperatorRejectsOversizedList(t *testing.T) {
 	}
 }
 
+// An ordering comparison against a non-numeric literal used to compile fine
+// and then silently match nothing — `elapsedMs > "abc"` reading as "no slow
+// traffic" rather than "you typed nonsense". Now that the literal is parsed
+// once at compile time (instead of on every evaluation), reject it there, the
+// same stance the language already takes on an unknown field name.
+func TestOrderingOperatorRejectsNonNumericLiteral(t *testing.T) {
+	for _, expr := range []string{
+		`elapsedMs > "abc"`,
+		`response.status < "five hundred"`,
+		`dst.port >= "high"`,
+		`l4.ttl <= "x"`,
+	} {
+		if _, err := CompileFilter(expr); err == nil {
+			t.Errorf("CompileFilter(%q) should reject a non-numeric literal for an ordering operator", expr)
+		}
+	}
+	// A numeric literal — quoted or bare — still compiles and evaluates.
+	e := sample() // StatusCode 503
+	for _, expr := range []string{`response.status > 500`, `response.status > "500"`} {
+		pred, err := CompileFilter(expr)
+		if err != nil {
+			t.Fatalf("CompileFilter(%q) error: %v", expr, err)
+		}
+		if !pred(e) {
+			t.Errorf("filter %q = false, want true", expr)
+		}
+	}
+	// An unknown field is still reported as such, not as a bad literal, when
+	// both are wrong.
+	_, err := CompileFilter(`bogus.field > "abc"`)
+	if err == nil || !strings.Contains(err.Error(), "unknown filter field") {
+		t.Errorf("bogus.field > \"abc\" error = %v, want an unknown-field error", err)
+	}
+}
+
+// The value on the right of a comparison is a constant of the expression, so
+// its CIDR/numeric/lowercase form is derived once at compile time. This pins
+// the observable half of that: a compiled predicate must not allocate per
+// evaluation for a plain string compare.
+func TestComparisonPredicateDoesNotAllocatePerEval(t *testing.T) {
+	pred, err := CompileFilter(`http.method == "POST"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := sample()
+	if allocs := testing.AllocsPerRun(100, func() { _ = pred(e) }); allocs != 0 {
+		t.Errorf("`http.method == \"POST\"` allocates %.1f times per evaluation, want 0 "+
+			"(the right-hand literal must be parsed at compile time, not per entry)", allocs)
+	}
+	// Same for the either-side namespace pseudo-field, which applies the
+	// matcher twice per entry.
+	nsPred, err := CompileFilter(`namespace != "kube-system"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _ = nsPred(e) }); allocs != 0 {
+		t.Errorf("`namespace != \"kube-system\"` allocates %.1f times per evaluation, want 0", allocs)
+	}
+}
+
+// "contains" folds case on both sides. The needle is pre-lowered at compile
+// time and tried against the raw value first (payload text is usually already
+// lowercase), so this pins that the fallback still matches a mixed-case value.
+func TestContainsIsCaseInsensitiveBothSides(t *testing.T) {
+	e := sample()
+	e.Request.Path = "/API/CheckOut"
+	cases := []struct {
+		expr string
+		want bool
+	}{
+		{`request.path contains "checkout"`, true}, // needle lower, value mixed
+		{`request.path contains "CHECKOUT"`, true}, // needle upper, value mixed
+		{`request.path contains "CheckOut"`, true}, // exact
+		{`request.path contains "cart"`, false},
+	}
+	for _, c := range cases {
+		pred, err := CompileFilter(c.expr)
+		if err != nil {
+			t.Fatalf("CompileFilter(%q) error: %v", c.expr, err)
+		}
+		if got := pred(e); got != c.want {
+			t.Errorf("filter %q = %v, want %v", c.expr, got, c.want)
+		}
+	}
+}
+
+// startswith compares only the first len(needle) bytes rather than lowercasing
+// the whole (possibly 100 KB) value. Multi-byte needles must still fold
+// correctly, and a value shorter than the needle must not slice out of range.
+func TestStartswithMultiByteAndShortValue(t *testing.T) {
+	e := sample()
+	e.Request.Host = "Café-Payments.shop"
+	cases := []struct {
+		expr string
+		want bool
+	}{
+		{`request.host startswith "café"`, true},  // multi-byte, needle lower
+		{`request.host startswith "CAFÉ"`, true},  // multi-byte, needle upper
+		{`request.host startswith "Café-"`, true}, // multi-byte + ASCII tail
+		{`request.host startswith "cafe"`, false}, // é is not e
+		// Needle longer than the value: must be a clean false, not a panic on
+		// the prefix slice.
+		{`request.host startswith "Café-Payments.shop-and-then-some"`, false},
+	}
+	for _, c := range cases {
+		pred, err := CompileFilter(c.expr)
+		if err != nil {
+			t.Fatalf("CompileFilter(%q) error: %v", c.expr, err)
+		}
+		if got := pred(e); got != c.want {
+			t.Errorf("filter %q = %v, want %v", c.expr, got, c.want)
+		}
+	}
+
+	// The whole point: the value is never copied to test its prefix.
+	pred, err := CompileFilter(`response.body startswith "{"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := &api.Entry{Response: api.Payload{Body: "{" + strings.Repeat("x", 100_000)}}
+	if allocs := testing.AllocsPerRun(50, func() { _ = pred(big) }); allocs != 0 {
+		t.Errorf("startswith on a 100 KB body allocates %.1f times per evaluation, want 0", allocs)
+	}
+	if !pred(big) {
+		t.Error(`response.body startswith "{" did not match a body starting with "{"`)
+	}
+}
+
+// fulltext lowercases while assembling the haystack instead of folding the
+// finished string, so this pins that the folding itself is unchanged —
+// including for non-ASCII, where Unicode folding can change the encoded byte
+// length and a byte-wise loop would corrupt the result.
+func TestFulltextLowercasesEquivalently(t *testing.T) {
+	e := sample()
+	e.Node = "NODE-Ünïcode"
+	e.Request.Host = "Payment.SHOP"
+	e.Request.Summary = "POST /API/Checkout"
+	e.Destination.Name = "PAYMENT-ÄPI"
+
+	got := fulltext(e)
+	if want := strings.ToLower(got); got != want {
+		t.Errorf("fulltext() is not fully lowercased:\n got %q\nwant %q", got, want)
+	}
+	for _, needle := range []string{"node-ünïcode", "payment.shop", "post /api/checkout", "payment-äpi"} {
+		if !strings.Contains(got, needle) {
+			t.Errorf("fulltext() = %q, missing lowercased %q", got, needle)
+		}
+	}
+
+	// And the bare-token (full-text) filter that consumes it still folds case.
+	for _, expr := range []string{"CHECKOUT", "checkout", "Ünïcode"} {
+		pred, err := CompileFilter(expr)
+		if err != nil {
+			t.Fatalf("CompileFilter(%q) error: %v", expr, err)
+		}
+		if !pred(e) {
+			t.Errorf("full-text filter %q = false, want true", expr)
+		}
+	}
+}
+
 // An unknown field must still be a compile error with the new operators, same
 // as with ==/!=/contains.
 func TestNewOperatorsRejectUnknownField(t *testing.T) {
