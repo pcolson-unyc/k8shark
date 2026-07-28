@@ -64,7 +64,17 @@ const (
 	// header + first topic name; the rest (bulk record batches on a Produce, the
 	// fetched records on a Fetch) is discarded, not allocated, so a large frame
 	// costs a bounded prefix.
-	kafkaScanBytes = 1 << 20
+	//
+	// 8 KiB is sized from what the parsers actually reach into, not from the
+	// frame size. Deepest request reach (Produce v3-v8, the worst case in
+	// kafkaRequestTopic): header 8 B + client_id (2+n) + transactional_id (2+n)
+	// + acks/timeout 6 B + topics count 4 B + topic name (2+n) — and Kafka caps
+	// topic names at 249 chars, leaving ~3.7 KiB of slack for EACH of the two
+	// ids, whose real-world length is tens of bytes (Fetch reaches even less:
+	// a <=25 B fixed prefix + the topic name). Deepest response reach
+	// (kafkaProduceFirstError) is ~270 B. A megabyte of scan buffer per frame
+	// was buying nothing but allocator pressure on Produce/Fetch-heavy nodes.
+	kafkaScanBytes = 8 << 10
 )
 
 // kafkaPending is a request awaiting its response, keyed by conn+correlation_id.

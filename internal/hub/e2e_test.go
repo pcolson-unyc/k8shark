@@ -359,3 +359,77 @@ func TestE2EReplayArrivesAsBatches(t *testing.T) {
 		}
 	}
 }
+
+// TestE2EWorkerEntryBatchIngest covers the worker->hub batching hop: a single
+// MsgEntryBatch frame must be indistinguishable from the same entries arriving
+// as individual MsgEntry frames — every entry enriched, stored, sequenced and
+// fanned out, and the worker's registry row credited for all of them.
+func TestE2EWorkerEntryBatchIngest(t *testing.T) {
+	s := New(discardLogger(), Options{})
+	ts := httptest.NewServer(s.handler())
+	defer ts.Close()
+
+	worker := dialWS(t, wsURL(ts.URL, "/ws/worker"), nil)
+	defer worker.Close()
+	writeEnvelope(t, worker, api.Envelope{Type: api.MsgHello, Hello: &api.Hello{Node: "node-b", Version: "test"}})
+	waitFor(t, func() bool {
+		for _, wi := range s.workerSnapshot() {
+			if wi.Node == "node-b" && wi.Connected {
+				return true
+			}
+		}
+		return false
+	}, "worker to register as connected")
+
+	front := dialWS(t, wsURL(ts.URL, "/ws"), nil)
+	defer front.Close()
+	if env := readEnvelope(t, front); env.Type != api.MsgStats {
+		t.Fatalf("first front frame type = %q, want %q", env.Type, api.MsgStats)
+	}
+
+	batch := []*api.Entry{httpEntry("b1"), httpEntry("b2"), httpEntry("b3")}
+	writeEnvelope(t, worker, api.Envelope{Type: api.MsgEntryBatch, Entries: batch})
+
+	// All three must reach the front, oldest first.
+	var got []string
+	for len(got) < 3 {
+		env := readEnvelope(t, front)
+		if env.Type != api.MsgEntryBatch {
+			continue // stats frames may interleave
+		}
+		for _, e := range env.Entries {
+			got = append(got, e.ID)
+		}
+	}
+	if got[0] != "b1" || got[1] != "b2" || got[2] != "b3" {
+		t.Errorf("front entry IDs = %v, want [b1 b2 b3]", got)
+	}
+
+	// All three must be in the store, and Seq must have been assigned per
+	// entry (the batch is not one unit as far as the ring buffer is concerned).
+	all := getEntries(t, ts.URL, "", "")
+	if len(all) != 3 {
+		t.Fatalf("/api/entries returned %d entries, want 3", len(all))
+	}
+	seqs := map[int64]bool{}
+	for _, e := range all {
+		if e.Seq == 0 {
+			t.Errorf("entry %s has no Seq assigned", e.ID)
+		}
+		if seqs[e.Seq] {
+			t.Errorf("duplicate Seq %d across batched entries", e.Seq)
+		}
+		seqs[e.Seq] = true
+	}
+
+	// The registry row is credited once per entry, not once per frame — this
+	// is the bookkeeping that was hoisted out of the ingest loop.
+	waitFor(t, func() bool {
+		for _, wi := range s.workerSnapshot() {
+			if wi.Node == "node-b" {
+				return wi.Entries == 3
+			}
+		}
+		return false
+	}, "node-b to be credited with all 3 batched entries")
+}

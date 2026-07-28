@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FilterBar } from "./FilterBar";
 import type { Entry } from "../types";
@@ -194,6 +194,90 @@ describe("FilterBar", () => {
 
     expect(createObjectURL).toHaveBeenCalledTimes(1);
     expect(clickSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // PCAP export is the one export that does not come from the in-page buffer:
+  // the hub synthesizes the same file from its whole ring buffer, so the
+  // download isn't capped at whatever MAX_ENTRIES this tab happens to hold.
+  describe("PCAP export", () => {
+    const sample: Entry[] = [
+      {
+        id: "e1",
+        protocol: "http",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        elapsedMs: 5,
+        node: "n",
+        src: { ip: "10.0.0.1", port: 1 },
+        dst: { ip: "10.0.0.2", port: 2 },
+        request: { summary: "GET /" },
+        response: {},
+        status: "success",
+        statusCode: 200,
+      },
+    ];
+
+    function stubDownload() {
+      const createObjectURL = vi.fn(() => "blob:mock");
+      vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL: vi.fn() });
+      const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+      return { createObjectURL, clickSpy };
+    }
+
+    // Also stubs GET /api/fields, which useFields() hits on mount.
+    function stubFetch(pcapResponse: Partial<Response>) {
+      const fetchMock = vi.fn((url: string) =>
+        url.startsWith("/api/pcap")
+          ? Promise.resolve(pcapResponse)
+          : Promise.resolve({ ok: true, json: () => Promise.resolve({ fields: [] }) })
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      return fetchMock;
+    }
+
+    it("downloads what the hub serves, scoped to the active filter", async () => {
+      const user = userEvent.setup();
+      const fetchMock = stubFetch({ ok: true, blob: () => Promise.resolve(new Blob([new Uint8Array([0xd4, 0xc3])])) });
+      const { createObjectURL } = stubDownload();
+
+      render(<FilterBar {...baseProps} entries={sample} count={1} value='protocol == "http"' />);
+      await user.click(screen.getByRole("button", { name: /export/i }));
+      await user.click(screen.getByRole("button", { name: /as pcap/i }));
+
+      await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+      expect(fetchMock).toHaveBeenCalledWith("/api/pcap?filter=protocol+%3D%3D+%22http%22");
+    });
+
+    it("passes the brushed window through when viewing a historical range", async () => {
+      const user = userEvent.setup();
+      const fetchMock = stubFetch({ ok: true, blob: () => Promise.resolve(new Blob()) });
+      const { createObjectURL } = stubDownload();
+      const historicalRange = { since: "2026-01-01T12:00:00.000Z", until: "2026-01-01T12:05:00.000Z" };
+
+      render(<FilterBar {...baseProps} entries={sample} count={1} historicalRange={historicalRange} />);
+      await user.click(screen.getByRole("button", { name: /export/i }));
+      await user.click(screen.getByRole("button", { name: /as pcap/i }));
+
+      await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/pcap?since=2026-01-01T12%3A00%3A00.000Z&until=2026-01-01T12%3A05%3A00.000Z"
+      );
+    });
+
+    it("falls back to synthesizing locally when the hub has no /api/pcap (older hub)", async () => {
+      const user = userEvent.setup();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchMock = stubFetch({ ok: false, status: 404 });
+      const { createObjectURL, clickSpy } = stubDownload();
+
+      render(<FilterBar {...baseProps} entries={sample} count={1} />);
+      await user.click(screen.getByRole("button", { name: /export/i }));
+      await user.click(screen.getByRole("button", { name: /as pcap/i }));
+
+      await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(1));
+      expect(fetchMock).toHaveBeenCalledWith("/api/pcap");
+      expect(clickSpy).toHaveBeenCalledTimes(1); // the file was still produced
+      warn.mockRestore();
+    });
   });
 
   it("shows a back-to-live button instead of Pause while viewing a historical range", async () => {

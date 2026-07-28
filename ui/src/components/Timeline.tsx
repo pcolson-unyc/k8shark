@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { memo, useRef, useState } from "react";
 import { useTimeline } from "../useTimeline";
 import type { TimelineBucket } from "../types";
 
@@ -23,7 +23,13 @@ interface Props {
 // a sub-range. Releasing the drag reports the selected window's [since,
 // until) as ISO timestamps — the caller decides what to do with it (this
 // component has no opinion on live vs. historical viewing).
-export function Timeline({ filter, onRangeSelect }: Props) {
+//
+// memo()'d: both props are stable (a filter string and a useCallback), while
+// App re-renders on every rAF flush of the live entry stream. The buckets this
+// draws come from its own polling hook and change every few seconds at most,
+// so without the memo the whole histogram was reconciled ~60 times a second
+// for nothing.
+export const Timeline = memo(function Timeline({ filter, onRangeSelect }: Props) {
   const { buckets, bucketSeconds } = useTimeline(filter);
   const svgRef = useRef<SVGSVGElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -143,4 +149,4 @@ export function Timeline({ filter, onRangeSelect }: Props) {
       )}
     </div>
   );
-}
+});

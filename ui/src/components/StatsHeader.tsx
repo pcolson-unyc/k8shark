@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { Stats, StatsPoint } from "../types";
 import { PROTO_COLORS } from "../constants";
 import { Sparkline } from "./Sparkline";
@@ -6,7 +7,12 @@ import { useWorkers } from "../useWorkers";
 
 const STATUS_ORDER = ["success", "warning", "error"] as const;
 
-export function StatsHeader({
+// memo()'d: everything the header shows changes at most once a second (the
+// hub's stats tick), but its parent re-renders with every rAF flush of the
+// live entry stream. The memo only holds if the callbacks App passes down are
+// themselves stable — see the useCallback()s around onProtoClick/onStatusClick
+// there.
+export const StatsHeader = memo(function StatsHeader({
   stats,
   statsHistory,
   connected,
@@ -121,7 +127,7 @@ export function StatsHeader({
       </button>
     </header>
   );
-}
+});
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (

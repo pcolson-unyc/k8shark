@@ -235,8 +235,29 @@ body {
   border-bottom: 1px solid var(--border); background: var(--bg-2); flex-shrink: 0; position: relative;
 }
 .table-toolbar-hint { color: var(--text-faint); font-size: 11px; }
-.table-wrap { flex: 1; overflow: auto; min-width: 0; }
-table.traffic { width: 100%; border-collapse: collapse; }
+/* contain: layout style scopes the scroller's layout work to itself — the row
+   window swaps rows in and out constantly, and without it every swap can dirty
+   layout for the rest of the page. */
+.table-wrap { flex: 1; overflow: auto; min-width: 0; contain: layout style; }
+/* table-layout: fixed is load-bearing, not cosmetic. Under auto layout the
+   browser must measure the content of every cell in the table to resolve the
+   column widths, and the virtualizer swaps the whole row window on every
+   scroll tick — so columns re-measure (and visibly jitter) mid-scroll. Fixed
+   layout takes the widths below from the header row alone and never looks at
+   the body. That means the column widths that remain below have to be `width`,
+   not `max-width` (fixed layout ignores max-width on columns); cells already
+   carry nowrap/overflow:hidden/ellipsis, so what gets truncated is unchanged.
+
+   The catch, and why only the narrow columns below are pinned: under fixed
+   layout the used table width is max(specified width, sum of column widths)
+   (CSS 2.1 §17.5.2.1), so a specified column width is a FLOOR, not a cap. Give
+   every column a px width and the table can no longer fit a narrow viewport —
+   it overflows .table-wrap (overflow: auto) sideways and takes the sticky
+   thead with it. So the flexible columns (summary/src/dst/node) are left at
+   width:auto: fixed layout hands them whatever is left over after the pinned
+   ones, and shrinks them — down to zero if it has to — instead of overflowing.
+   Do not add a width (or min-width, equally a floor) to them. */
+table.traffic { width: 100%; border-collapse: collapse; table-layout: fixed; }
 table.traffic thead th {
   position: sticky; top: 0; z-index: 1;
   background: var(--bg-2); color: var(--text-faint);
@@ -253,11 +274,10 @@ table.traffic thead th[aria-sort] { color: var(--accent); }
 .row td { padding: 6px 12px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .col-proto { width: 62px; }
 .col-status { width: 66px; }
-.col-summary { max-width: 320px; }
-.col-src, .col-dst { max-width: 190px; color: var(--text-dim); }
+.col-src, .col-dst { color: var(--text-dim); }
 .col-lat { width: 74px; color: var(--text-dim); text-align: right; }
 .col-time { width: 118px; color: var(--text-faint); }
-.col-node { max-width: 140px; color: var(--text-dim); }
+.col-node { color: var(--text-dim); }
 .col-bytes, .col-packets { width: 84px; color: var(--text-dim); text-align: right; }
 .empty td { color: var(--text-faint); text-align: center; padding: 40px; font-style: italic; }
 .load-older td { text-align: center; padding: 14px; }
@@ -483,9 +503,12 @@ table.kv.rec .kv-k { width: 68px; color: var(--accent); }
     border-left: none; border-top: 1px solid var(--border);
   }
   .table-wrap { max-height: 50vh; }
+  /* Dropping the time column is the only narrowing lever here: every other
+     px width in the table is a floor under table-layout: fixed (see the note
+     above table.traffic), so re-pinning summary/src/dst at phone widths would
+     force the table to overflow instead of shrink. Left at width:auto they
+     just split whatever is left. */
   .col-time { display: none; }
-  .col-summary { max-width: 40vw; }
-  .col-src, .col-dst { max-width: 90px; }
 
   .map-toolbar { flex-wrap: wrap; row-gap: 8px; }
   .map-toolbar-hint { flex-basis: 100%; margin-left: 0; }

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,5 +198,151 @@ func TestSinkConnectsWSSWithCustomCA(t *testing.T) {
 	}
 	if err := s.connect(); err != nil {
 		t.Fatalf("wss connect with custom CA: %v", err)
+	}
+}
+
+// --- WRK-BATCH: worker -> hub entry batching --------------------------------
+
+// workerReadLimitMirror is a hand-kept copy of hub.workerReadLimit
+// (internal/hub/server.go). The worker package deliberately does not import the
+// hub — that would drag gopacket's dependency tree into the hub binary — so the
+// coupling is enforced by this mirror plus the cross-referencing comments on
+// both constants. If the hub lowers its read limit, this test starts failing,
+// which is the point.
+const workerReadLimitMirror = 4 << 20
+
+// batchEntry builds an entry whose marshaled size is roughly padBytes, so the
+// byte-budget cases below can be expressed in entry counts. The padding is
+// printable ASCII on purpose: NUL bytes JSON-escape to a 6-character \u0000
+// sequence, which would make the marshaled size 6x the padding and the budget
+// assertions meaningless.
+func batchEntry(id string, padBytes int) *api.Entry {
+	e := &api.Entry{
+		ID: id, Protocol: api.ProtocolHTTP, Timestamp: time.Unix(0, 0).UTC(),
+		Status: "success",
+	}
+	if padBytes > 0 {
+		e.Request.Body = strings.Repeat("x", padBytes)
+	}
+	return e
+}
+
+// decodeFrame unmarshals a frame assembled by assembleBatch. The frames are
+// hand-spliced rather than produced by json.Marshal(Envelope{...}), so this
+// also proves the splice yields valid JSON in the shape the hub expects.
+func decodeFrame(t *testing.T, frame []byte) api.Envelope {
+	t.Helper()
+	var env api.Envelope
+	if err := json.Unmarshal(frame, &env); err != nil {
+		t.Fatalf("assembled frame is not valid JSON: %v\nframe: %s", err, frame)
+	}
+	return env
+}
+
+// TestAssembleBatchSingleEntryStaysMsgEntry pins the version-skew guarantee: a
+// lone entry must go out as a plain MsgEntry frame, exactly as it did before
+// batching existed, so a worker newer than its hub still delivers.
+func TestAssembleBatchSingleEntryStaysMsgEntry(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	frame, batched := s.assembleBatch(batchEntry("a", 0))
+	if len(batched) != 1 || batched[0].ID != "a" {
+		t.Fatalf("batched = %+v, want exactly entry a", batched)
+	}
+	env := decodeFrame(t, frame)
+	if env.Type != api.MsgEntry {
+		t.Errorf("type = %q, want %q", env.Type, api.MsgEntry)
+	}
+	if env.Entry == nil || env.Entry.ID != "a" {
+		t.Errorf("entry = %+v, want a", env.Entry)
+	}
+	if len(env.Entries) != 0 {
+		t.Errorf("entries = %+v, want empty on a single-entry frame", env.Entries)
+	}
+}
+
+// TestAssembleBatchCoalescesQueued covers the actual win: everything already
+// sitting on the channel goes out in one frame, oldest first.
+func TestAssembleBatchCoalescesQueued(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	first := batchEntry("a", 0)
+	for _, id := range []string{"b", "c", "d"} {
+		s.emit(batchEntry(id, 0))
+	}
+	frame, batched := s.assembleBatch(first)
+	if len(batched) != 4 {
+		t.Fatalf("batched %d entries, want 4", len(batched))
+	}
+	env := decodeFrame(t, frame)
+	if env.Type != api.MsgEntryBatch {
+		t.Fatalf("type = %q, want %q", env.Type, api.MsgEntryBatch)
+	}
+	var ids []string
+	for _, e := range env.Entries {
+		ids = append(ids, e.ID)
+	}
+	want := []string{"a", "b", "c", "d"}
+	for i := range want {
+		if i >= len(ids) || ids[i] != want[i] {
+			t.Fatalf("entry IDs = %v, want %v (oldest first)", ids, want)
+		}
+	}
+	if len(s.ch) != 0 {
+		t.Errorf("%d entries left queued, want the batch to have drained them", len(s.ch))
+	}
+}
+
+// TestAssembleBatchStopsAtEntryCap keeps the frame bounded by count even when
+// the channel is deeper than one batch, and leaves the remainder queued for the
+// next iteration rather than dropping it.
+func TestAssembleBatchStopsAtEntryCap(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	const extra = 10
+	for i := 0; i < sinkBatchMaxEntries+extra; i++ {
+		s.emit(batchEntry("q", 0))
+	}
+	_, batched := s.assembleBatch(batchEntry("first", 0))
+	if len(batched) != sinkBatchMaxEntries {
+		t.Errorf("batched %d entries, want the %d cap", len(batched), sinkBatchMaxEntries)
+	}
+	// first + cap-1 drained from the channel, so the remainder stays queued.
+	if got, want := len(s.ch), extra+1; got != want {
+		t.Errorf("%d entries left queued, want %d", got, want)
+	}
+}
+
+// TestAssembleBatchStopsAtByteBudget is the one that keeps the hub connection
+// alive: an oversized frame is not truncated by gorilla, it fails the read and
+// kills the connection, so the budget must bind before workerReadLimit does.
+func TestAssembleBatchStopsAtByteBudget(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	const pad = 64 << 10 // 8 of these exceed the 512 KiB budget
+	for i := 0; i < 32; i++ {
+		s.emit(batchEntry("q", pad))
+	}
+	frame, batched := s.assembleBatch(batchEntry("first", pad))
+	if len(batched) >= 32 {
+		t.Errorf("batched %d entries — the byte budget never bound", len(batched))
+	}
+	// The budget is checked before appending, so the frame can overshoot by at
+	// most one entry plus the envelope wrapper.
+	if max := sinkBatchMaxBytes + 2*pad; len(frame) > max {
+		t.Errorf("frame is %d bytes, want <= %d", len(frame), max)
+	}
+	if len(frame) > workerReadLimitMirror {
+		t.Errorf("frame is %d bytes, over the hub's %d read limit", len(frame), workerReadLimitMirror)
+	}
+}
+
+// TestAssembleBatchAlwaysIncludesFirst: a single entry larger than the whole
+// byte budget must still be sent. Dropping it would lose captured traffic
+// purely to make a frame smaller.
+func TestAssembleBatchAlwaysIncludesFirst(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	frame, batched := s.assembleBatch(batchEntry("huge", sinkBatchMaxBytes*2))
+	if len(batched) != 1 || batched[0].ID != "huge" {
+		t.Fatalf("batched = %+v, want the oversized entry kept", batched)
+	}
+	if env := decodeFrame(t, frame); env.Entry == nil || env.Entry.ID != "huge" {
+		t.Errorf("frame did not carry the oversized entry")
 	}
 }

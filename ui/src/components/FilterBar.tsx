@@ -328,7 +328,7 @@ export function FilterBar({
             Top
           </button>
         </div>
-        <ExportMenu entries={entries} />
+        <ExportMenu entries={entries} filter={value} historicalRange={historicalRange} />
       </div>
 
       <div className="examples">
@@ -342,11 +342,19 @@ export function FilterBar({
   );
 }
 
-// ExportMenu downloads the entries currently loaded client-side (i.e.
-// whatever the live/filtered buffer holds right now) as JSON, CSV, or a
-// synthesized PCAP. Purely local — a Blob built from data already in the
-// page, no server round trip.
-function ExportMenu({ entries }: { entries: Entry[] }) {
+// ExportMenu downloads what the table is showing as JSON, CSV, or a
+// synthesized PCAP. JSON/CSV are purely local — a Blob built from the entries
+// already in the page, no server round trip. PCAP goes through the hub (see
+// exportPcap) because it can cover far more than the browser happens to hold.
+function ExportMenu({
+  entries,
+  filter,
+  historicalRange,
+}: {
+  entries: Entry[];
+  filter: string;
+  historicalRange: HistoricalRange | null;
+}) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -359,16 +367,45 @@ function ExportMenu({ entries }: { entries: Entry[] }) {
     return () => document.removeEventListener("mousedown", onDocMouseDown);
   }, [open]);
 
-  const doExport = (format: "json" | "csv" | "pcap") => {
+  // The hub synthesizes the same pcap server-side (internal/hub/pcap.go) from
+  // its whole ring buffer, so exporting through GET /api/pcap isn't bounded by
+  // the last MAX_ENTRIES this browser happened to receive — and it doesn't
+  // make the tab build a multi-megabyte file byte by byte. The query mirrors
+  // what's on screen: the active filter and, in historical mode, the brushed
+  // window. A hub too old to serve the endpoint answers 404 (or the fetch
+  // fails outright) — fall back to the local synthesis so a mismatched
+  // deployment degrades instead of breaking the button.
+  const exportPcap = async (): Promise<Uint8Array | Blob> => {
+    const q = new URLSearchParams();
+    if (filter) q.set("filter", filter);
+    if (historicalRange) {
+      q.set("since", historicalRange.since);
+      q.set("until", historicalRange.until);
+    }
+    const qs = q.toString();
+    try {
+      const res = await fetch(`/api/pcap${qs ? `?${qs}` : ""}`);
+      if (!res.ok) throw new Error(`pcap export: HTTP ${res.status}`);
+      return await res.blob();
+    } catch (err) {
+      console.warn("hub pcap export unavailable, falling back to the local buffer", err);
+      return entriesToPcap(entries);
+    }
+  };
+
+  // Closes the menu up front rather than after the work: the pcap path now
+  // awaits the hub, and leaving the menu hanging open for the round trip
+  // would read as an unresponsive click.
+  const doExport = async (format: "json" | "csv" | "pcap") => {
+    setOpen(false);
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     if (format === "json") {
       downloadFile(entriesToJSON(entries), `k8shark-entries-${stamp}.json`, "application/json");
     } else if (format === "csv") {
       downloadFile(entriesToCSV(entries), `k8shark-entries-${stamp}.csv`, "text/csv");
     } else {
-      downloadFile(entriesToPcap(entries), `k8shark-entries-${stamp}.pcap`, "application/vnd.tcpdump.pcap");
+      downloadFile(await exportPcap(), `k8shark-entries-${stamp}.pcap`, "application/vnd.tcpdump.pcap");
     }
-    setOpen(false);
   };
 
   return (
@@ -386,17 +423,17 @@ function ExportMenu({ entries }: { entries: Entry[] }) {
       </button>
       {open && (
         <div className="col-picker-menu" role="menu">
-          <button type="button" className="col-picker-item" onClick={() => doExport("json")}>
+          <button type="button" className="col-picker-item" onClick={() => void doExport("json")}>
             as JSON
           </button>
-          <button type="button" className="col-picker-item" onClick={() => doExport("csv")}>
+          <button type="button" className="col-picker-item" onClick={() => void doExport("csv")}>
             as CSV
           </button>
           <button
             type="button"
             className="col-picker-item"
-            onClick={() => doExport("pcap")}
-            title="Synthesized from already-captured payload bytes and L4 metadata — not a live packet capture"
+            onClick={() => void doExport("pcap")}
+            title="Synthesized by the hub from already-captured payload bytes and L4 metadata — not a live packet capture. Covers the hub's whole buffer for the current filter, not just the entries loaded here."
           >
             as PCAP
           </button>

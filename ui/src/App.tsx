@@ -97,19 +97,32 @@ export function App() {
   // Pin up to two entries for the compare view; pinning a third drops the
   // oldest pin. Pinning holds a snapshot of the entry, not just its id, so a
   // pin survives the entry aging out of the live buffer.
-  const togglePin = (e: Entry) => {
+  //
+  // Every callback handed down from here is a useCallback with no (or only
+  // rarely-changing) dependencies. App re-renders on every rAF flush of the
+  // live stream, so a fresh closure per render would change a prop identity
+  // 60x/s and defeat the memo() on TrafficTable — and, through onTogglePin,
+  // the memo() on every single Row inside it.
+  const togglePin = useCallback((e: Entry) => {
     setPinned((prev) => {
       if (prev.some((p) => p.id === e.id)) return prev.filter((p) => p.id !== e.id);
       if (prev.length >= 2) return [prev[1], e];
       return [...prev, e];
     });
-  };
+  }, []);
 
-  const onApply = (f: string) => {
-    setFilter(f);
-    hub.applyFilter(f);
-    closeSelection();
-  };
+  const openCompare = useCallback(() => setShowCompare(true), []);
+  const closeCompare = useCallback(() => setShowCompare(false), []);
+
+  const { applyFilter } = hub;
+  const onApply = useCallback(
+    (f: string) => {
+      setFilter(f);
+      applyFilter(f);
+      closeSelection();
+    },
+    [applyFilter, closeSelection]
+  );
 
   // Resolve a ?entry=<id> permalink on first load. Not necessarily in the
   // live/replayed buffer yet (or ever, if it aged out) — fetch it directly.
@@ -143,13 +156,16 @@ export function App() {
   const activeStatus = useMemo(() => activeFieldValue(filter, STATUS_CLAUSE_RE), [filter]);
 
   // Click a protocol pill / status chip to add/swap/remove its clause in the
-  // filter.
-  const onProtoClick = (proto: string) => {
-    onApply(toggleFieldFilter(filter, PROTO_CLAUSE_RE, "protocol", proto));
-  };
-  const onStatusClick = (status: string) => {
-    onApply(toggleFieldFilter(filter, STATUS_CLAUSE_RE, "status", status));
-  };
+  // filter. Memoised (they only change when the filter does) so memo(StatsHeader)
+  // isn't defeated by a new closure on every live flush.
+  const onProtoClick = useCallback(
+    (proto: string) => onApply(toggleFieldFilter(filter, PROTO_CLAUSE_RE, "protocol", proto)),
+    [filter, onApply]
+  );
+  const onStatusClick = useCallback(
+    (status: string) => onApply(toggleFieldFilter(filter, STATUS_CLAUSE_RE, "status", status)),
+    [filter, onApply]
+  );
 
   // Global shortcuts: "/" focuses the filter (unless already typing
   // somewhere), space toggles pause (only when nothing specific has focus,
@@ -172,23 +188,33 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [paused, setPaused, closeSelection]);
 
-  // Index the live buffer by id once per change so the selected-entry lookup
-  // below is O(1) instead of an entries.find() linear scan on every render —
-  // the buffer can hold 10k+ entries and hub.entries gets a fresh identity on
-  // every rAF flush, so the scan otherwise re-ran each frame (UI-8).
-  const entriesById = useMemo(() => {
-    const byId = new Map<string, Entry>();
-    for (const e of hub.entries) byId.set(e.id, e);
-    return byId;
-  }, [hub.entries]);
-
   // Keep the selected entry object in sync with the freshest list reference.
+  //
+  // Deliberately a plain find(), gated on there being a selection at all: this
+  // used to build an id→entry Map over the whole buffer (UI-8), which re-indexed
+  // 2k–10k entries on every rAF flush — hub.entries gets a fresh identity each
+  // frame — purely to resolve the single id we already hold. Don't re-add the
+  // Map: one linear scan of a fresh array is strictly cheaper than building an
+  // index over it, and with nothing selected we do no work at all. The
+  // `?? selected` fallback is load-bearing: a ?entry= permalink resolves an
+  // entry that may never be in the live buffer (see the fetch effect above).
   const selectedLive = useMemo(
-    () => (selected ? entriesById.get(selected.id) ?? selected : null),
-    [selected, entriesById]
+    () => (selected ? hub.entries.find((e) => e.id === selected.id) ?? selected : null),
+    [selected, hub.entries]
   );
 
   const pinnedIds = useMemo(() => new Set(pinned.map((p) => p.id)), [pinned]);
+
+  // Applying a clause from the map/top views also switches back to the list.
+  // Memoised for the same reason as the callbacks above: ServiceMap memoises
+  // its node subcomponents on this identity.
+  const applyClauseAndShowList = useCallback(
+    (clause: string) => {
+      onApply(clause);
+      setView("list");
+    },
+    [onApply]
+  );
 
   return (
     <div className="app">
@@ -230,34 +256,22 @@ export function App() {
             noMoreHistory={hub.noMoreHistory}
             pinnedIds={pinnedIds}
             onTogglePin={togglePin}
-            onCompare={() => setShowCompare(true)}
+            onCompare={openCompare}
           />
           {selectedLive && (
             <EntryDetail entry={selectedLive} onClose={closeSelection} onApply={onApply} />
           )}
           {showCompare && pinned.length === 2 && (
-            <CompareView a={pinned[0]} b={pinned[1]} onClose={() => setShowCompare(false)} />
+            <CompareView a={pinned[0]} b={pinned[1]} onClose={closeCompare} />
           )}
         </div>
       ) : view === "map" ? (
         <div className="main">
-          <ServiceMap
-            entries={hub.entries}
-            onNodeClick={(clause) => {
-              onApply(clause);
-              setView("list");
-            }}
-          />
+          <ServiceMap entries={hub.entries} onNodeClick={applyClauseAndShowList} />
         </div>
       ) : (
         <div className="main">
-          <TopView
-            filter={filter}
-            onApply={(clause) => {
-              onApply(clause);
-              setView("list");
-            }}
-          />
+          <TopView filter={filter} onApply={applyClauseAndShowList} />
         </div>
       )}
     </div>

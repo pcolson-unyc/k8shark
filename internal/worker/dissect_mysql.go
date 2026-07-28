@@ -162,7 +162,7 @@ func (p *pipeline) mysqlRequests(br *bufio.Reader, cr *capReader, key string, sr
 			if cmd == comStmtPrepare {
 				name = "COM_STMT_PREPARE"
 			}
-			p.enqueueRequest(key, api.ProtocolMySQL, mysqlQueryPayload(string(payload[1:]), name, rawOf(cr)), src, dst)
+			p.enqueueRequest(key, api.ProtocolMySQL, mysqlQueryPayload(payload[1:], name, rawOf(cr)), src, dst)
 		case comStmtExecute:
 			summary := "COM_STMT_EXECUTE"
 			if len(payload) >= 5 {
@@ -386,13 +386,20 @@ func mysqlErrSummary(code int, msg string) string {
 	return "ERROR " + strconv.Itoa(code) + ": " + truncate(collapseWS(msg), 160)
 }
 
-func mysqlQueryPayload(q, cmd string, raw *api.RawView) api.Payload {
-	q = strings.TrimSpace(q)
+// mysqlQueryPayload builds the request payload for a COM_QUERY /
+// COM_STMT_PREPARE. It takes the raw payload bytes rather than a string so the
+// queryCap cut (caps.go) happens BEFORE the copy: a command packet is
+// materialized up to mysqlMaxPayload (4 MiB), and stringifying all of it just
+// to keep the first 8 KiB would both copy and retain megabytes per entry.
+func mysqlQueryPayload(q []byte, cmd string, raw *api.RawView) api.Payload {
+	text, truncated := capQueryBytes(q)
+	text = strings.TrimSpace(text)
 	return api.Payload{
-		Query:   q,
-		Summary: truncate(collapseWS(q), 160),
-		Raw:     raw,
-		MySQL:   &api.MySQLDetail{Command: cmd},
+		Query:     text,
+		Summary:   truncate(collapseWS(text), 160),
+		Truncated: truncated,
+		Raw:       raw,
+		MySQL:     &api.MySQLDetail{Command: cmd},
 	}
 }
 

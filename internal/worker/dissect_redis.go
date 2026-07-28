@@ -48,35 +48,44 @@ func (p *pipeline) consumeRedisID(c connID, r io.Reader, isRequest bool, proto a
 
 	if isRequest {
 		src, dst := c.endpoints()
+		// The SELECTed DB is per-connection state, and this loop IS the
+		// connection's client direction: one goroutine, one stream, read by
+		// nobody else. So it lives here as a local instead of in a mutex-guarded
+		// map keyed by conn — a map that also had to outlive the stream and be
+		// swept by gc() to not leak on ephemeral-port churn.
+		db := 0
 		for {
 			v, err := parseRESP(br)
 			if err != nil {
 				_, _ = io.Copy(io.Discard, br)
 				return
 			}
-			cmd := renderRedisCommand(v)
+			args, argsCut := redisArgs(v)
+			cmd, cmdCut := capQuery(redisCommandLine(v, args))
 			if cmd == "" {
 				continue
 			}
-			args := redisArgs(v)
 			// Track the connection's selected DB from SELECT n so every
 			// subsequent command reports the DB it ran against.
 			if len(args) == 2 && strings.EqualFold(args[0], "SELECT") {
 				if n, err := strconv.Atoi(args[1]); err == nil {
-					p.setRedisDB(key, n)
+					db = n
 				}
 			}
 			if p.redactHeaders {
 				if redacted, ok := redactSensitiveRedisArgs(args); ok {
 					args = redacted
-					cmd = strings.Join(redacted, " ")
+					var cut bool
+					cmd, cut = capQuery(strings.Join(redacted, " "))
+					cmdCut = cmdCut || cut
 				}
 			}
 			p.enqueueRequest(key, proto, api.Payload{
-				Command: cmd,
-				Summary: truncate(cmd, 160),
-				Raw:     rawOf(cr),
-				Redis:   &api.RedisDetail{Args: args, DBIndex: p.redisDBFor(key)},
+				Command:   cmd,
+				Summary:   truncate(cmd, 160),
+				Truncated: cmdCut || argsCut,
+				Raw:       rawOf(cr),
+				Redis:     &api.RedisDetail{Args: args, DBIndex: db},
 			}, src, dst)
 		}
 	}
@@ -110,36 +119,6 @@ func (p *pipeline) consumeRedisID(c connID, r io.Reader, isRequest bool, proto a
 			Redis:   &api.RedisDetail{Reply: reply, ReplyType: respTypeName(v.typ), Attributes: v.attrs},
 		}, 0, status, time.Time{})
 	}
-}
-
-// redisDBState is the per-connection SELECTed DB index plus a last-seen stamp so
-// gc() can prune entries for churned-through ephemeral ports (see p.redisDB).
-type redisDBState struct {
-	db int
-	ts time.Time
-}
-
-// redisDBFor / setRedisDB track the per-connection SELECTed DB index under p.mu.
-// Both refresh the last-seen stamp so an actively used connection is never GC'd.
-func (p *pipeline) redisDBFor(key string) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	r := p.redisDB[key]
-	if r == nil {
-		return 0
-	}
-	r.ts = time.Now()
-	return r.db
-}
-
-func (p *pipeline) setRedisDB(key string, n int) {
-	p.mu.Lock()
-	if r := p.redisDB[key]; r != nil {
-		r.db, r.ts = n, time.Now()
-	} else {
-		p.redisDB[key] = &redisDBState{db: n, ts: time.Now()}
-	}
-	p.mu.Unlock()
 }
 
 // respVal is a parsed RESP2/RESP3 value. typ is the RESP type byte; 'i' marks an
@@ -335,22 +314,63 @@ func isRedisPrintable(s string) bool {
 	return true
 }
 
-// redisArgs returns the command and its arguments as a flat string slice.
-func redisArgs(v respVal) []string {
+// redisArgs returns the command and its arguments as a flat string slice,
+// bounded at redisMaxArgs elements (caps.go). The second result reports whether
+// the tail was dropped, which the caller surfaces as Payload.Truncated. Only the
+// element COUNT is bounded here — element VALUES are already bounded by
+// redisScalar -> redisDisplay (redisMaxValueDisplay), so nothing is double-capped.
+// The over-cap elements are never even rendered: for a 1M-element pipelined MSET
+// that is the difference between 64 short strings and hundreds of MiB.
+func redisArgs(v respVal) ([]string, bool) {
 	switch v.typ {
 	case '*', '~':
-		out := make([]string, 0, len(v.arr))
-		for _, el := range v.arr {
+		n := min(len(v.arr), redisMaxArgs)
+		out := make([]string, 0, n+1)
+		for _, el := range v.arr[:n] {
 			out = append(out, redisScalar(el))
 		}
-		return out
+		if len(v.arr) > n {
+			return append(out, redisMoreMarker(len(v.arr)-n)), true
+		}
+		return out, false
 	case 'i':
-		return strings.Fields(v.str)
+		return capRedisArgs(strings.Fields(v.str))
 	default:
 		if s := redisScalar(v); s != "" {
-			return []string{s}
+			return []string{s}, false
 		}
-		return nil
+		return nil, false
+	}
+}
+
+// capRedisArgs bounds an already-materialized argument slice at redisMaxArgs,
+// replacing the dropped tail with the "… (N more)" marker.
+func capRedisArgs(args []string) ([]string, bool) {
+	if len(args) <= redisMaxArgs {
+		return args, false
+	}
+	// Full slice expression: appending must allocate rather than overwrite
+	// args[redisMaxArgs], which the caller may still be holding.
+	return append(args[:redisMaxArgs:redisMaxArgs], redisMoreMarker(len(args)-redisMaxArgs)), true
+}
+
+// redisMoreMarker renders the synthetic trailing element standing in for the
+// arguments dropped at redisMaxArgs.
+func redisMoreMarker(n int) string {
+	return fmt.Sprintf("… (%d more)", n)
+}
+
+// redisCommandLine renders the printable command line for an already-capped
+// argument slice. For the aggregate shapes it joins args instead of re-rendering
+// every element through renderRedisCommand — which both halves the rendering
+// work on the hot path and keeps the line inside redisMaxArgs. Other shapes
+// (inline, scalar) have no arg-level structure to reuse and fall back.
+func redisCommandLine(v respVal, args []string) string {
+	switch v.typ {
+	case '*', '~':
+		return strings.Join(args, " ")
+	default:
+		return renderRedisCommand(v)
 	}
 }
 

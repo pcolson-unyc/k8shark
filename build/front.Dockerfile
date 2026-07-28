@@ -3,7 +3,12 @@
 FROM node:22-alpine AS build
 WORKDIR /ui
 COPY ui/package.json ui/package-lock.json* ./
-RUN npm ci --no-audit --no-fund
+# The npm cache mount needs BuildKit (default builder since Docker 23, always
+# used by `docker buildx`). It's a local-dev speedup only: CI's layer cache
+# export doesn't carry cache mounts, so a cold CI build behaves exactly as
+# before.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund
 COPY ui/ .
 RUN npm run build
 

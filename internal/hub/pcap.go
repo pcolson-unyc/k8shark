@@ -267,24 +267,45 @@ func parseIPv4(s string) net.IP {
 }
 
 // pcapPayloadBytes recovers one direction's application bytes for the
-// synthesized frame: the real captured bytes from RawView.hex when present
-// (worker hexdump.go format), else the decoded body or one-line summary so an
-// entry without a raw capture still contributes readable content. Mirrors
-// ui/src/pcap.ts payloadBytes.
+// synthesized frame: the real captured bytes from RawView or the decoded body,
+// whichever carries more bytes, else the one-line summary so an entry without
+// either still contributes readable content. Mirrors ui/src/pcap.ts
+// payloadBytes.
 func pcapPayloadBytes(p *api.Payload) []byte {
 	if p == nil {
 		return nil
 	}
-	if p.Raw != nil && p.Raw.Hex != "" {
-		if b := parseHexDump(p.Raw.Hex); len(b) > 0 {
-			return b
-		}
+	var raw []byte
+	switch {
+	case p.Raw == nil:
+	case len(p.Raw.Data) > 0:
+		// Current workers ship the bytes directly (base64 on the wire).
+		raw = p.Raw.Data
+	case p.Raw.Hex != "":
+		// Legacy path: a worker older than this hub pre-rendered the sample as
+		// a hexdump -C block, so decode it back. Kept for rolling upgrades and
+		// for replaying entries captured by an older build.
+		raw = parseHexDump(p.Raw.Hex)
+	}
+	// Raw and Body are capped independently (worker raw-capture cap vs. the
+	// body cap), so Raw can be a much SHORTER sample of the same exchange than
+	// the body the hub already holds — preferring Raw unconditionally would let
+	// a lowered raw-capture cap silently degrade the export. Pick whichever
+	// source carries more bytes, keeping Raw on a tie: Raw is the byte-exact
+	// capture, whereas Body has been through decompression/text handling and
+	// isn't byte-exact for binary protocols, so at equal length Raw is the more
+	// faithful source. Only the lengths are compared — the two views are never
+	// merged, since they don't necessarily cover the same bytes.
+	if len(raw) > 0 && len(raw) >= len(p.Body) {
+		return raw
 	}
 	text := p.Body
 	if text == "" {
 		text = p.Summary
 	}
 	if text == "" {
+		// Unreachable with a non-empty raw (that would have won the tie above),
+		// so there is nothing left to emit for this direction.
 		return nil
 	}
 	return []byte(text)

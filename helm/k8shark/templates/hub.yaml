@@ -141,8 +141,20 @@ spec:
             {{- with .Values.hub.export.webhook }}
             - --export-webhook={{ . }}
             {{- end }}
-          {{- if or .Values.hub.apiToken .Values.hub.workerToken .Values.hub.adminToken }}
+          {{- $goMemLimit := include "k8shark.hubGoMemLimit" . }}
+          {{- if or .Values.hub.apiToken .Values.hub.workerToken .Values.hub.adminToken $goMemLimit }}
           env:
+            {{- if $goMemLimit }}
+            # Soft heap ceiling at 80% of the container's memory limit, so the
+            # GC pushes back before the cgroup hard limit becomes an OOMKill
+            # (the ring buffer is the bulk of the heap and it fills up to
+            # hub.bufferSize regardless). Derived from the chart value rather
+            # than a downward-API resourceFieldRef — see values.yaml and
+            # k8shark.hubGoMemLimit in _helpers.tpl for why. Absent entirely
+            # when no memory limit is configured.
+            - name: GOMEMLIMIT
+              value: {{ $goMemLimit | quote }}
+            {{- end }}
             {{- if .Values.hub.apiToken }}
             - name: K8SHARK_API_TOKEN
               valueFrom:

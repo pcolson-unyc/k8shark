@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { isTypingTarget } from "../dom";
@@ -78,16 +78,37 @@ function compareEntries(a: Entry, b: Entry, key: SortKey): number {
   return String(va).localeCompare(String(vb));
 }
 
+// cellContent runs once per visible cell per render — with the row window and
+// a live feed that's on the order of a thousand calls a second — so anything
+// it would otherwise allocate per call is hoisted to module scope: one frozen
+// style object per protocol (a fresh literal is a new prop identity every
+// time, which forces the <span> to re-apply its style), and one shared
+// Intl.DateTimeFormat, since toLocaleTimeString constructs (and, at best,
+// cache-looks-up) a formatter on every single call.
+const PROTO_BADGE_STYLES: Record<string, CSSProperties> = Object.fromEntries(
+  Object.entries(PROTO_COLORS).map(([proto, color]) => [proto, { background: color }])
+);
+const UNKNOWN_PROTO_BADGE_STYLE: CSSProperties = { background: "#888" };
+
+// Exactly the options Date.prototype.toLocaleTimeString([], { hour12: false })
+// resolves to (it defaults hour/minute/second to "numeric" when none of the
+// time components are given), so the rendered text is unchanged — see the
+// byte-identical assertion in TrafficTable.test.tsx.
+const TIME_FORMAT = new Intl.DateTimeFormat([], {
+  hour12: false,
+  hour: "numeric",
+  minute: "numeric",
+  second: "numeric",
+});
+
 function cellContent(key: string, e: Entry): ReactNode {
   switch (key) {
-    case "proto": {
-      const color = PROTO_COLORS[e.protocol] ?? "#888";
+    case "proto":
       return (
-        <span className="proto-badge" style={{ background: color }}>
+        <span className="proto-badge" style={PROTO_BADGE_STYLES[e.protocol] ?? UNKNOWN_PROTO_BADGE_STYLE}>
           {e.protocol}
         </span>
       );
-    }
     case "status":
       return <StatusBadge entry={e} />;
     case "summary":
@@ -240,26 +261,39 @@ export const TrafficTable = memo(function TrafficTable({
   // here since displayEntries (the active sort order) and the virtualizer
   // are local to this component. No selection yet -> jumps to the first row;
   // otherwise moves by one, clamped at the ends (no wraparound).
+  //
+  // What the handler reads is held in a ref rather than listed as effect
+  // dependencies: displayEntries gets a brand-new identity on every rAF flush
+  // of the live stream, so depending on it directly tore down and re-added a
+  // global keydown listener ~60 times a second for a handler whose behaviour
+  // never changes. The ref is written during render, so the listener always
+  // sees the latest committed values. (rowVirtualizer is *not* in that
+  // category — useVirtualizer hands back one stable instance for the lifetime
+  // of the component — so it stays a real dependency.)
+  const keyNavRef = useRef({ displayEntries, selectedId, onSelect });
+  keyNavRef.current = { displayEntries, selectedId, onSelect };
+
   useEffect(() => {
     const onKeyDown = (ev: KeyboardEvent) => {
       if (ev.key !== "ArrowDown" && ev.key !== "ArrowUp") return;
       if (isTypingTarget(ev.target)) return;
-      if (displayEntries.length === 0) return;
-      const curIdx = selectedId ? displayEntries.findIndex((e) => e.id === selectedId) : -1;
+      const { displayEntries: rows, selectedId: curId, onSelect: select } = keyNavRef.current;
+      if (rows.length === 0) return;
+      const curIdx = curId ? rows.findIndex((e) => e.id === curId) : -1;
       const next =
         curIdx === -1
           ? 0
           : ev.key === "ArrowDown"
-            ? Math.min(curIdx + 1, displayEntries.length - 1)
+            ? Math.min(curIdx + 1, rows.length - 1)
             : Math.max(curIdx - 1, 0);
       if (next === curIdx) return;
       ev.preventDefault();
-      onSelect(displayEntries[next]);
+      select(rows[next]);
       rowVirtualizer.scrollToIndex(next);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [displayEntries, selectedId, onSelect, rowVirtualizer]);
+  }, [rowVirtualizer]);
 
   // Live entries are prepended to the front of the list (newest first), so
   // without this every flush shifts whatever the user is currently reading
@@ -540,5 +574,14 @@ function endpoint(ep: { name?: string; ip: string; port: number; namespace?: str
 
 function time(ts: string): string {
   const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+  // The one place the hoisted formatter is NOT equivalent to the
+  // toLocaleTimeString call it replaced: on an Invalid Date, toLocaleTimeString
+  // returns the string "Invalid Date", while Intl.DateTimeFormat's format()
+  // throws a RangeError (ECMA-402, PartitionDateTimePattern step 1). A single
+  // entry with an unparseable timestamp landing in the row window would throw
+  // during render, and there's no error boundary above the table — React would
+  // unmount the whole App subtree, i.e. a blank page instead of one junk cell.
+  // Degrade to the raw timestamp instead.
+  if (Number.isNaN(d.getTime())) return ts;
+  return TIME_FORMAT.format(d) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }

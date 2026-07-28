@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/pablocolson/k8shark/pkg/api"
 )
@@ -310,39 +311,64 @@ func (p *parser) parseComparison() (Predicate, error) {
 		}
 		return buildFieldPredicate(field, re.MatchString)
 	case "startswith":
-		needle := strings.ToLower(val)
+		// Case-fold just the first len(val) bytes instead of lowercasing the
+		// whole field value: `response.body startswith "{"` used to copy an
+		// entire 100 KB body to look at one byte, once per entry, per client,
+		// per ring slot. EqualFold folds rune by rune over that window, the same
+		// rule == already uses. The one behavioural corner is a value whose
+		// prefix case-folds to a *different byte length* than the needle (a
+		// handful of runes, e.g. "ẞ"/"ß") — no field the dissectors produce
+		// carries those, and matching a fixed window is what makes this O(len
+		// needle) instead of O(len body).
 		return buildFieldPredicate(field, func(actual string) bool {
-			return strings.HasPrefix(strings.ToLower(actual), needle)
+			return len(actual) >= len(val) && strings.EqualFold(actual[:len(val)], val)
 		})
 	}
 
 	// namespace/ns matches either side (src or dst) rather than a single
-	// struct field, so it can't go through the single-getter-then-compare
-	// path below. == and contains are true if EITHER side matches
-	// (inclusion, "show me shop traffic wherever it touches shop"); != is
-	// true only if NEITHER side matches (exclusion, "hide kube-system
-	// noise") — the useful reading, not the De Morgan-literal "either side
-	// differs" (which would be true for nearly every entry).
+	// struct field, so it can't go through the single-getter path below. == and
+	// contains are true if EITHER side matches (inclusion, "show me shop
+	// traffic wherever it touches shop"); != is true only if NEITHER side
+	// matches (exclusion, "hide kube-system noise") — the useful reading, not
+	// the De Morgan-literal "either side differs" (which would be true for
+	// nearly every entry). != is therefore built from the "==" matcher and
+	// negated as a whole.
 	fieldLower := strings.ToLower(field)
 	if fieldLower == "namespace" || fieldLower == "ns" {
+		matchOp := op
+		if op == "!=" {
+			matchOp = "=="
+		}
+		// Compiled once here, not per side and not per entry: this path applies
+		// the matcher twice per evaluation, so deriving it from val inside the
+		// closure would pay the constant cost twice over.
+		match, err := valueMatcher(field, matchOp, val)
+		if err != nil {
+			return nil, err
+		}
+		if op == "!=" {
+			return func(e *api.Entry) bool {
+				return !match(e.Source.Namespace) && !match(e.Destination.Namespace)
+			}, nil
+		}
 		return func(e *api.Entry) bool {
-			if op == "!=" {
-				return !compare(e.Source.Namespace, "==", val) && !compare(e.Destination.Namespace, "==", val)
-			}
-			return compare(e.Source.Namespace, op, val) || compare(e.Destination.Namespace, op, val)
+			return match(e.Source.Namespace) || match(e.Destination.Namespace)
 		}, nil
 	}
 
 	// An unknown field must be a compile error, not a silent match-nothing: a
 	// typo like `http.status_code == 500` returning zero entries reads as "no
-	// errors" to whoever wrote it.
+	// errors" to whoever wrote it. Resolved before the value matcher so a typo'd
+	// field reports as such even when the literal is also bad.
 	getter := fieldGetter(field)
 	if getter == nil {
 		return nil, fmt.Errorf("unknown filter field %q (GET /api/fields lists the catalog)", field)
 	}
-	return func(e *api.Entry) bool {
-		return compare(getter(e), op, val)
-	}, nil
+	match, err := valueMatcher(field, op, val)
+	if err != nil {
+		return nil, err
+	}
+	return func(e *api.Entry) bool { return match(getter(e)) }, nil
 }
 
 // parseInList parses a parenthesized, comma-separated literal list after
@@ -395,46 +421,90 @@ func buildFieldPredicate(field string, match func(actual string) bool) (Predicat
 	return func(e *api.Entry) bool { return match(getter(e)) }, nil
 }
 
-// compare evaluates "actual op want". want in CIDR form (e.g. "10.0.0.0/8")
-// makes == / != a range-containment test against actual as an IP (either
-// family), instead of the literal string compare they'd otherwise fall to —
-// no *.ip field's real value is ever itself a CIDR literal, so this can't
-// misfire against a legitimate exact-match use. Otherwise numeric comparison
-// is used when both sides parse as numbers; failing that, string comparison
-// (case-insensitive).
-func compare(actual, op, want string) bool {
-	if op == "==" || op == "!=" {
+// valueMatcher compiles "<field value> op want" into a closure that tests one
+// resolved field value. Everything derivable from want — which is a *constant*
+// of the expression — is done here, once, at compile time: the returned closure
+// runs per entry × per connected client × per ring slot on every REST scan, so
+// a net.ParseCIDR (allocating a *net.ParseError on the normal non-CIDR path)
+// or a strconv.ParseFloat of the same literal inside it is pure waste repeated
+// millions of times.
+//
+// want in CIDR form (e.g. "10.0.0.0/8") makes == / != a range-containment test
+// against the value as an IP (either family), instead of the literal string
+// compare they'd otherwise fall to — no *.ip field's real value is ever itself
+// a CIDR literal, so this can't misfire against a legitimate exact-match use.
+// Ordering comparisons need a numeric want; anything else is a compile error
+// (see below). Everything else compares case-insensitively as a string.
+func valueMatcher(field, op, want string) (func(actual string) bool, error) {
+	switch op {
+	case "==", "!=":
 		if _, ipnet, err := net.ParseCIDR(want); err == nil {
-			contained := false
-			if ip := net.ParseIP(actual); ip != nil {
-				contained = ipnet.Contains(ip)
-			}
 			if op == "!=" {
-				return !contained
+				return func(actual string) bool {
+					ip := net.ParseIP(actual)
+					return ip == nil || !ipnet.Contains(ip)
+				}, nil
 			}
-			return contained
+			return func(actual string) bool {
+				ip := net.ParseIP(actual)
+				return ip != nil && ipnet.Contains(ip)
+			}, nil
+		}
+		if op == "!=" {
+			return func(actual string) bool { return !strings.EqualFold(actual, want) }, nil
+		}
+		return func(actual string) bool { return strings.EqualFold(actual, want) }, nil
+
+	case "contains":
+		lowWant := strings.ToLower(want)
+		return func(actual string) bool {
+			// Try the needle against the raw value first: payload text (paths,
+			// queries, hostnames) is usually already lowercase, so this hits
+			// without allocating the lowercased copy of a potentially large
+			// field. A hit here is never a false positive — lowWant is already
+			// folded, so any literal occurrence survives ToLower too.
+			if strings.Contains(actual, lowWant) {
+				return true
+			}
+			return strings.Contains(strings.ToLower(actual), lowWant)
+		}, nil
+
+	case ">", "<", ">=", "<=":
+		// A non-numeric literal used to make the whole comparison silently
+		// match nothing (`elapsedMs > "abc"` returned zero entries, reading as
+		// "no slow traffic"). Same stance as an unknown field name: reject it at
+		// compile time so the mistake is visible to whoever typed it.
+		wf, err := strconv.ParseFloat(want, 64)
+		if err != nil {
+			return nil, fmt.Errorf("field %q: operator %q needs a numeric value, got %q", field, op, want)
+		}
+		switch op {
+		case ">":
+			return func(actual string) bool {
+				af, err := strconv.ParseFloat(actual, 64)
+				return err == nil && af > wf
+			}, nil
+		case "<":
+			return func(actual string) bool {
+				af, err := strconv.ParseFloat(actual, 64)
+				return err == nil && af < wf
+			}, nil
+		case ">=":
+			return func(actual string) bool {
+				af, err := strconv.ParseFloat(actual, 64)
+				return err == nil && af >= wf
+			}, nil
+		default: // "<="
+			return func(actual string) bool {
+				af, err := strconv.ParseFloat(actual, 64)
+				return err == nil && af <= wf
+			}, nil
 		}
 	}
-	af, aerr := strconv.ParseFloat(actual, 64)
-	wf, werr := strconv.ParseFloat(want, 64)
-	numeric := aerr == nil && werr == nil
-	switch op {
-	case "==":
-		return strings.EqualFold(actual, want)
-	case "!=":
-		return !strings.EqualFold(actual, want)
-	case "contains":
-		return strings.Contains(strings.ToLower(actual), strings.ToLower(want))
-	case ">":
-		return numeric && af > wf
-	case "<":
-		return numeric && af < wf
-	case ">=":
-		return numeric && af >= wf
-	case "<=":
-		return numeric && af <= wf
-	}
-	return false
+	// Unreachable via the lexer (it only ever emits the operators handled above
+	// plus in/matches/startswith, which parseComparison peels off first), but an
+	// error beats a predicate that silently matches nothing.
+	return nil, fmt.Errorf("field %q: unsupported operator %q", field, op)
 }
 
 // fieldGetter resolves a dotted field path to an accessor. Unknown fields
@@ -823,65 +893,92 @@ func l4Str(e *api.Entry, get func(*api.L4Info) string) string {
 
 // fulltext builds a lowercase haystack of an entry's salient fields for bare
 // full-text matching.
+//
+// Each part is lowercased *while* it is written rather than by a
+// strings.ToLower(sb.String()) at the end: the trailing form materialised the
+// haystack twice (once assembled, once folded), so a bare-token filter paid two
+// allocations and a full extra copy per entry, per client, per ring slot.
 func fulltext(e *api.Entry) string {
 	var sb strings.Builder
-	sb.WriteString(string(e.Protocol))
+	writeLower(&sb, string(e.Protocol))
 	sb.WriteByte(' ')
-	sb.WriteString(e.Node)
+	writeLower(&sb, e.Node)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Source.IP)
+	writeLower(&sb, e.Source.IP)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Source.Name)
+	writeLower(&sb, e.Source.Name)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Destination.IP)
+	writeLower(&sb, e.Destination.IP)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Destination.Name)
+	writeLower(&sb, e.Destination.Name)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Request.Summary)
+	writeLower(&sb, e.Request.Summary)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Request.Method)
+	writeLower(&sb, e.Request.Method)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Request.Path)
+	writeLower(&sb, e.Request.Path)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Request.Host)
+	writeLower(&sb, e.Request.Host)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Request.Question)
+	writeLower(&sb, e.Request.Question)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Request.Command)
+	writeLower(&sb, e.Request.Command)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Request.Query)
+	writeLower(&sb, e.Request.Query)
 	sb.WriteByte(' ')
-	sb.WriteString(e.Response.Summary)
+	writeLower(&sb, e.Response.Summary)
 	// Richer sub-object text (WS3), nil-guarded.
 	if e.Request.HTTP != nil && e.Request.HTTP.ContentType != "" {
 		sb.WriteByte(' ')
-		sb.WriteString(e.Request.HTTP.ContentType)
+		writeLower(&sb, e.Request.HTTP.ContentType)
 	}
 	if e.Response.DNS != nil {
 		for _, a := range e.Response.DNS.Answers {
 			sb.WriteByte(' ')
-			sb.WriteString(a.Data)
+			writeLower(&sb, a.Data)
 		}
 	}
 	if e.Request.Postgres != nil && e.Request.Postgres.StatementName != "" {
 		sb.WriteByte(' ')
-		sb.WriteString(e.Request.Postgres.StatementName)
+		writeLower(&sb, e.Request.Postgres.StatementName)
 	}
 	if e.Request.Exchange != "" || e.Request.RoutingKey != "" || e.Request.Queue != "" {
 		sb.WriteByte(' ')
-		sb.WriteString(e.Request.Exchange)
+		writeLower(&sb, e.Request.Exchange)
 		sb.WriteByte(' ')
-		sb.WriteString(e.Request.RoutingKey)
+		writeLower(&sb, e.Request.RoutingKey)
 		sb.WriteByte(' ')
-		sb.WriteString(e.Request.Queue)
+		writeLower(&sb, e.Request.Queue)
 	}
 	if e.L4 != nil && e.L4.TLS != nil && e.L4.TLS.SNI != "" {
 		sb.WriteByte(' ')
-		sb.WriteString(e.L4.TLS.SNI)
+		writeLower(&sb, e.L4.TLS.SNI)
 	}
 	if e.Request.Kafka != nil && e.Request.Kafka.Topic != "" {
 		sb.WriteByte(' ')
-		sb.WriteString(e.Request.Kafka.Topic)
+		writeLower(&sb, e.Request.Kafka.Topic)
 	}
-	return strings.ToLower(sb.String())
+	return sb.String()
+}
+
+// writeLower appends s to sb lowercased, producing exactly what
+// strings.ToLower(s) would — ASCII is folded byte-wise in place, and the first
+// non-ASCII byte hands the remainder to strings.ToLower, whose Unicode folding
+// can change the encoded length (so a byte-wise loop cannot handle it).
+func writeLower(sb *strings.Builder, s string) {
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= utf8.RuneSelf:
+			sb.WriteString(s[start:i])
+			sb.WriteString(strings.ToLower(s[i:]))
+			return
+		case c >= 'A' && c <= 'Z':
+			sb.WriteString(s[start:i])
+			sb.WriteByte(c + ('a' - 'A'))
+			start = i + 1
+		}
+	}
+	sb.WriteString(s[start:])
 }

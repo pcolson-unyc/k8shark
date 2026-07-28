@@ -28,6 +28,26 @@ const sinkWriteTimeout = 10 * time.Second
 // capture state to the hub (surfaced at /api/workers).
 const sinkStatsInterval = 10 * time.Second
 
+// sinkBatchMaxEntries and sinkBatchMaxBytes bound one MsgEntryBatch frame.
+//
+// The hub->front leg has coalesced entries into batches for a while; this is
+// the same trick on the worker->hub leg, which was the last unbatched hop. The
+// batch is drained *opportunistically* — pump only ever takes what is already
+// sitting in s.ch — so unlike the hub's timer-driven flush it adds exactly zero
+// latency: a quiet node still sends one entry per frame the instant it is
+// produced, and batching only kicks in once entries are arriving faster than
+// they can be written, which is precisely when the per-frame syscall and
+// per-frame json.Unmarshal at the hub start to matter.
+//
+// sinkBatchMaxBytes must stay comfortably below the hub's per-connection read
+// limit (workerReadLimit in internal/hub/server.go) or an oversized frame kills
+// the connection instead of being delivered. The two constants are deliberately
+// far apart so neither has to move when the other is tuned.
+const (
+	sinkBatchMaxEntries = 64
+	sinkBatchMaxBytes   = 512 << 10
+)
+
 // sink is a reconnecting WebSocket client that ships entries to the hub. Entries
 // are buffered on a channel; if the hub is unreachable the buffer drops the
 // newest (incoming) entry rather than blocking capture.
@@ -228,6 +248,69 @@ func (s *sink) reader(conn *websocket.Conn) {
 	}
 }
 
+// assembleBatch marshals first plus whatever else is *already* queued on s.ch
+// into a single frame, and returns that frame together with the entries it
+// covers so a failed write can requeue exactly those and nothing else. It never
+// blocks waiting for more: the drain stops at the first empty read.
+//
+// A lone entry goes out as a plain MsgEntry frame, byte-identical to what the
+// worker sent before batching existed. That costs nothing to keep and means a
+// version-skewed pair — a worker newer than its hub, which is what a rolling
+// upgrade looks like for a few seconds — still delivers at low traffic instead
+// of silently discarding everything into the hub's unknown-message default.
+//
+// Entries are marshaled individually and spliced, rather than marshaling one
+// Envelope holding the slice, so the byte budget can be enforced as the batch
+// grows. The first entry is always included even if it alone exceeds the
+// budget: dropping it here would lose captured traffic to make a frame smaller.
+func (s *sink) assembleBatch(first *api.Entry) ([]byte, []*api.Entry) {
+	if first == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(first)
+	if err != nil {
+		return nil, nil
+	}
+	raws := [][]byte{b}
+	entries := []*api.Entry{first}
+	size := len(b)
+
+drain:
+	for len(entries) < sinkBatchMaxEntries && size < sinkBatchMaxBytes {
+		select {
+		case e := <-s.ch:
+			if e == nil {
+				continue
+			}
+			eb, err := json.Marshal(e)
+			if err != nil {
+				continue // same silent skip a marshal failure got before batching
+			}
+			raws = append(raws, eb)
+			entries = append(entries, e)
+			size += len(eb)
+		default:
+			break drain // nothing else queued — send now rather than wait for more
+		}
+	}
+
+	if len(raws) == 1 {
+		frame := make([]byte, 0, len(`{"type":"entry","entry":}`)+len(raws[0]))
+		frame = append(frame, `{"type":"entry","entry":`...)
+		frame = append(frame, raws[0]...)
+		return append(frame, '}'), entries
+	}
+	frame := make([]byte, 0, len(`{"type":"entryBatch","entries":[]}`)+size+len(raws))
+	frame = append(frame, `{"type":"entryBatch","entries":[`...)
+	for i, r := range raws {
+		if i > 0 {
+			frame = append(frame, ',')
+		}
+		frame = append(frame, r...)
+	}
+	return append(frame, `]}`...), entries
+}
+
 // pump writes buffered entries (plus a periodic self-report frame) to the
 // current connection until it errors or ctx is cancelled.
 func (s *sink) pump(ctx context.Context) {
@@ -273,16 +356,20 @@ func (s *sink) pump(ctx context.Context) {
 				return
 			}
 		case e := <-s.ch:
-			b, err := json.Marshal(api.Envelope{Type: api.MsgEntry, Entry: e})
-			if err != nil {
+			frame, batched := s.assembleBatch(e)
+			if len(batched) == 0 {
 				continue
 			}
-			if write(b) != nil {
-				// Requeue the entry we failed to send, then bail to reconnect.
-				s.emit(e)
+			if write(frame) != nil {
+				// Requeue everything we failed to send, then bail to
+				// reconnect. emit() drops on a full buffer exactly as it does
+				// for fresh capture, so a wedged hub can't grow the queue.
+				for _, re := range batched {
+					s.emit(re)
+				}
 				return
 			}
-			s.sent.Add(1)
+			s.sent.Add(uint64(len(batched)))
 		}
 	}
 }

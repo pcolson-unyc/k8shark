@@ -21,7 +21,14 @@ const (
 	amqpFrameBody      = 3
 	amqpFrameHeartbeat = 8
 	amqpMaxFrame       = 16 << 20 // wire-sanity guard vs misparse/TLS; real frame-max default is 131072
-	amqpMaxCapture     = 1 << 20  // frame bytes materialized in memory; the rest is discarded, not allocated
+	// amqpMaxCapture bounds the frame bytes materialized in memory; the rest is
+	// discarded, not allocated. 64 KiB is half the default negotiated frame-max
+	// (131072), and the only frames that ever approach frame-max are
+	// CONTENT_BODY — of which at most p.bodyCap (4096 by default) bytes are
+	// ever retained, so scanning further was already dead weight. The frames
+	// actually parsed field-by-field (METHOD args, the content HEADER property
+	// list) are orders of magnitude smaller, so 64 KiB still leaves them whole.
+	amqpMaxCapture = 64 << 10
 )
 
 // AMQP class IDs.

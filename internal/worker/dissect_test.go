@@ -2014,3 +2014,171 @@ func TestKafkaFlexibleVersionSurfaced(t *testing.T) {
 		t.Errorf("status = %q, want success", got[0].Status)
 	}
 }
+
+// --- retention caps: queryCap / redisMaxArgs (caps.go) ----------------------
+
+// A machine-generated statement far past queryCap must be retained as a
+// bounded prefix and flagged Truncated — the hub keeps every entry alive for
+// the whole ring buffer, so an unbounded Query is unbounded resident memory.
+func TestPostgresQueryCappedAtQueryCap(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
+	rNet, rTr, sNet, sTr := flows(40700, pgPort)
+
+	sql := "SELECT * FROM t WHERE id IN (" + strings.Repeat("1,", 40000) + "1)"
+	if len(sql) <= queryCap {
+		t.Fatalf("test statement is only %d bytes, must exceed queryCap (%d)", len(sql), queryCap)
+	}
+	req := append(pgStartup(), pgMsg('Q', append([]byte(sql), 0))...)
+	resp := pgMsg('C', []byte("SELECT 1\x00"))
+
+	p.consumePostgres(rNet, rTr, strings.NewReader(string(req)), true)
+	p.consumePostgres(sNet, sTr, strings.NewReader(string(resp)), false)
+
+	got := drain(s)
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1", len(got))
+	}
+	q := got[0].Request.Query
+	if len(q) > queryCap+len("…") {
+		t.Errorf("retained query is %d bytes, want <= queryCap (%d)", len(q), queryCap)
+	}
+	if !strings.HasPrefix(q, "SELECT * FROM t WHERE id IN (1,1,") {
+		t.Errorf("query prefix = %.40q, want the head of the statement", q)
+	}
+	if !strings.HasSuffix(q, "…") {
+		t.Errorf("cut query %.20q… must end with the ellipsis marker", q)
+	}
+	if !got[0].Request.Truncated {
+		t.Error("Request.Truncated = false, want true for a query cut at queryCap")
+	}
+	if len(got[0].Request.Summary) > 160+len("…") {
+		t.Errorf("summary is %d bytes, want <= 160", len(got[0].Request.Summary))
+	}
+
+	// A statement under the cap is kept verbatim and NOT flagged.
+	if pl := pgQueryPayload("SELECT 1", nil); pl.Query != "SELECT 1" || pl.Truncated {
+		t.Errorf("short query payload = %+v, want untouched and unflagged", pl)
+	}
+}
+
+// Same contract on the MySQL side (COM_QUERY payloads are materialized up to
+// mysqlMaxPayload before the cap applies).
+func TestMySQLQueryCappedAtQueryCap(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
+	rNet, rTr, sNet, sTr := flows(40701, mysqlPort)
+
+	sql := "INSERT INTO t VALUES " + strings.Repeat("(1),", 20000) + "(1)"
+	if len(sql) <= queryCap {
+		t.Fatalf("test statement is only %d bytes, must exceed queryCap (%d)", len(sql), queryCap)
+	}
+	req := comQueryPacket(sql)
+	// OK reply at seq 1 (no greeting: capture started mid-connection).
+	resp := mysqlPacket(1, []byte{0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00})
+
+	p.consumeStream(rNet, rTr, strings.NewReader(string(req)))
+	p.consumeStream(sNet, sTr, strings.NewReader(string(resp)))
+
+	got := drain(s)
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1", len(got))
+	}
+	q := got[0].Request.Query
+	if len(q) > queryCap+len("…") {
+		t.Errorf("retained query is %d bytes, want <= queryCap (%d)", len(q), queryCap)
+	}
+	if !strings.HasPrefix(q, "INSERT INTO t VALUES (1),") || !strings.HasSuffix(q, "…") {
+		t.Errorf("query = %.40q…, want the cut head of the statement", q)
+	}
+	if !got[0].Request.Truncated {
+		t.Error("Request.Truncated = false, want true for a query cut at queryCap")
+	}
+	if pl := mysqlQueryPayload([]byte("SELECT 1"), "COM_QUERY", nil); pl.Query != "SELECT 1" || pl.Truncated {
+		t.Errorf("short query payload = %+v, want untouched and unflagged", pl)
+	}
+}
+
+// A pipelined MSET with far more arguments than redisMaxArgs keeps a bounded
+// argument list plus a synthetic "… (N more)" tail, so the drop is visible.
+// Element VALUES are already bounded (redisMaxValueDisplay); this is the
+// element COUNT bound.
+func TestRedisArgsCappedAtRedisMaxArgs(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
+	rNet, rTr, sNet, sTr := flows(40702, redisPort)
+
+	const pairs = 200
+	nargs := 1 + 2*pairs
+	var b strings.Builder
+	b.WriteString("*" + strconv.Itoa(nargs) + "\r\n$4\r\nMSET\r\n")
+	for i := 0; i < pairs; i++ {
+		k, v := "k"+strconv.Itoa(i), "v"+strconv.Itoa(i)
+		b.WriteString("$" + strconv.Itoa(len(k)) + "\r\n" + k + "\r\n")
+		b.WriteString("$" + strconv.Itoa(len(v)) + "\r\n" + v + "\r\n")
+	}
+
+	p.consumeRedis(rNet, rTr, strings.NewReader(b.String()), true, api.ProtocolRedis)
+	p.consumeRedis(sNet, sTr, strings.NewReader("+OK\r\n"), false, api.ProtocolRedis)
+
+	got := drain(s)
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1", len(got))
+	}
+	rd := got[0].Request.Redis
+	if rd == nil {
+		t.Fatalf("no Redis detail: %+v", got[0].Request)
+	}
+	if len(rd.Args) != redisMaxArgs+1 {
+		t.Fatalf("kept %d args, want redisMaxArgs+1 (%d)", len(rd.Args), redisMaxArgs+1)
+	}
+	if rd.Args[0] != "MSET" || rd.Args[1] != "k0" {
+		t.Errorf("args head = %v, want the start of the command", rd.Args[:2])
+	}
+	if want := "… (" + strconv.Itoa(nargs-redisMaxArgs) + " more)"; rd.Args[redisMaxArgs] != want {
+		t.Errorf("tail element = %q, want %q", rd.Args[redisMaxArgs], want)
+	}
+	if !got[0].Request.Truncated {
+		t.Error("Request.Truncated = false, want true when arguments were dropped")
+	}
+	if !strings.HasPrefix(got[0].Request.Command, "MSET k0 v0 ") || strings.Contains(got[0].Request.Command, "k199") {
+		t.Errorf("command = %.40q, want the capped argument list", got[0].Request.Command)
+	}
+
+	// A command within the cap keeps every argument and stays unflagged.
+	small, err := parseRESP(bufio.NewReader(strings.NewReader("*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args, cut := redisArgs(small); cut || len(args) != 3 {
+		t.Errorf("redisArgs(SET a b) = %v, cut=%v, want 3 args uncut", args, cut)
+	}
+}
+
+// A command document larger than mongoScanBytes is materialized only as a
+// prefix; the message must still be identified by its first key (the command
+// name) instead of being dropped wholesale.
+func TestMongoOversizedCommandDocKeepsCommand(t *testing.T) {
+	s := newSink("", "", "n", discardLogger())
+	p := newPipeline(s, "n", "1.2.3.4", discardLogger())
+	rNet, rTr, sNet, sTr := flows(40703, mongoPort)
+
+	// find + a filter value that pushes the document past mongoScanBytes, with
+	// $db deliberately last (as the drivers emit it) so it falls off the cut.
+	huge := strings.Repeat("x", mongoScanBytes+4096)
+	doc := bsonDoc(bsonStrElem("find", "users"), bsonStrElem("filter", huge), bsonStrElem("$db", "shop"))
+	req := opMsgMsg(300, 0, doc)
+	resp := opMsgMsg(301, 300, bsonDoc(bsonDblElem("ok", 1.0)))
+
+	p.consumeStream(rNet, rTr, strings.NewReader(string(req)))
+	p.consumeStream(sNet, sTr, strings.NewReader(string(resp)))
+
+	got := drain(s)
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1", len(got))
+	}
+	m := got[0].Request.Mongo
+	if m == nil || m.Command != "find" || m.Collection != "users" {
+		t.Fatalf("request mongo = %+v, want find/users from the truncated prefix", m)
+	}
+}

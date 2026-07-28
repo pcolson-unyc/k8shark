@@ -64,11 +64,16 @@ type resolver struct {
 	token  string
 	client *http.Client
 
-	mu   sync.RWMutex
-	byIP map[string]ref
+	// byIP is the IP -> identity snapshot. It is only ever *replaced* wholesale
+	// by refresh (never mutated in place, so a reader can safely keep reading
+	// the map it loaded), which makes an atomic pointer swap the exact fit: the
+	// two RWMutex RLocks enrich() used to take per entry — on the path every
+	// captured packet's entry crosses — become two atomic loads with no
+	// cross-core cacheline ping-pong between concurrent worker connections.
+	byIP atomic.Pointer[map[string]ref]
 
-	// pmu guards pending. Kept separate from mu so catch-up bookkeeping never
-	// contends with byIP readers/writers on the hot enrich() path.
+	// pmu guards pending, and nothing else: catch-up bookkeeping must never
+	// contend with the hot enrich() path (which now reads byIP lock-free).
 	pmu sync.Mutex
 	// pending is the catch-up registry: entries whose endpoint IP wasn't known
 	// at ingest, keyed by entry ID, so a later refresh can re-run enrichment
@@ -100,7 +105,8 @@ type resolver struct {
 }
 
 func newResolver(log *slog.Logger) *resolver {
-	r := &resolver{log: log, byIP: map[string]ref{}, pending: map[string]*pendingResolve{}}
+	r := &resolver{log: log, pending: map[string]*pendingResolve{}}
+	r.setByIP(map[string]ref{})
 	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
 	token, err := os.ReadFile(saTokenPath)
 	if host == "" || err != nil {
@@ -176,23 +182,25 @@ func (r *resolver) refresh(ctx context.Context) {
 			m[ip] = rf
 		}
 	}
-	r.mu.Lock()
-	r.byIP = m
-	r.mu.Unlock()
+	r.setByIP(m)
 	// Now that the map is fresh, re-run enrichment for entries that were bare at
 	// ingest — a pod created between two refreshes is resolvable from this point.
 	late := r.retryPending()
 	r.log.Debug("k8s enrichment refreshed", "endpoints", len(m), "lateResolved", late)
 }
 
-// get performs an authenticated GET and decodes the JSON body into out.
-func (r *resolver) get(ctx context.Context, path string, out any) bool {
+// get performs an authenticated GET and decodes the JSON body into out. accept
+// overrides the Accept header when non-empty (see metadataOnlyAccept).
+func (r *resolver) get(ctx context.Context, path, accept string, out any) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.api+path, nil)
 	if err != nil {
 		return false
 	}
+	if accept == "" {
+		accept = "application/json"
+	}
 	req.Header.Set("Authorization", "Bearer "+r.token)
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", accept)
 	resp, err := r.client.Do(req)
 	if err != nil {
 		r.log.Warn("k8s enrichment request failed", "path", path, "err", err)
@@ -224,10 +232,22 @@ type objMeta struct {
 	} `json:"ownerReferences"`
 }
 
+// metadataOnlyAccept asks the apiserver to convert the response to a
+// PartialObjectMetadataList — every item reduced to its ObjectMeta. The
+// resolver decodes nothing but metadata (name/namespace/ownerReferences), yet a
+// plain list ships each object's full spec: for ReplicaSets that means the
+// entire embedded pod template on every object, megabytes per refresh cycle in
+// a cluster with a few hundred of them. The trailing application/json keeps the
+// full object as a fallback for an apiserver that won't do the conversion —
+// both shapes decode identically here, since objMeta only ever reads
+// "metadata" and the list envelope is the same either way.
+const metadataOnlyAccept = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json"
+
 // listAll GETs a paginated list endpoint, following the continue token, and
-// returns every item. ok is false when any page failed (callers then keep
-// their previous state rather than working from a partial list).
-func listAll[T any](ctx context.Context, r *resolver, path string) (items []T, ok bool) {
+// returns every item. accept, when non-empty, overrides the Accept header. ok
+// is false when any page failed (callers then keep their previous state rather
+// than working from a partial list).
+func listAll[T any](ctx context.Context, r *resolver, path, accept string) (items []T, ok bool) {
 	var page struct {
 		Metadata struct {
 			Continue string `json:"continue"`
@@ -237,12 +257,22 @@ func listAll[T any](ctx context.Context, r *resolver, path string) (items []T, o
 	cont := ""
 	for {
 		u := path + "?limit=" + strconv.Itoa(listPageSize)
-		if cont != "" {
+		if cont == "" {
+			// resourceVersion=0 means "any version you already have": the
+			// apiserver serves the first page straight from its watch cache
+			// instead of doing a quorum read against etcd. Three of those every
+			// enrichInterval, per hub, is real etcd load for data that is
+			// allowed to be a moment stale (a missed pod is picked up by the
+			// next cycle, or by the catch-up registry). It is only valid on the
+			// first page — passing it alongside a continue token is rejected
+			// with 400, since the token already pins the resource version.
+			u += "&resourceVersion=0"
+		} else {
 			u += "&continue=" + url.QueryEscape(cont)
 		}
 		page.Metadata.Continue = ""
 		page.Items = nil
-		if !r.get(ctx, u, &page) {
+		if !r.get(ctx, u, accept, &page) {
 			return nil, false
 		}
 		items = append(items, page.Items...)
@@ -261,7 +291,7 @@ func (r *resolver) listReplicaSetOwners(ctx context.Context) map[string]string {
 	type rs struct {
 		Metadata objMeta `json:"metadata"`
 	}
-	items, ok := listAll[rs](ctx, r, "/apis/apps/v1/replicasets")
+	items, ok := listAll[rs](ctx, r, "/apis/apps/v1/replicasets", metadataOnlyAccept)
 	if !ok {
 		return nil
 	}
@@ -311,7 +341,7 @@ func (r *resolver) listPods(ctx context.Context, rsOwners map[string]string) map
 			} `json:"podIPs"`
 		} `json:"status"`
 	}
-	items, ok := listAll[pod](ctx, r, "/api/v1/pods")
+	items, ok := listAll[pod](ctx, r, "/api/v1/pods", "")
 	if !ok {
 		return nil
 	}
@@ -345,7 +375,7 @@ func (r *resolver) listServices(ctx context.Context) map[string]ref {
 			ClusterIPs []string `json:"clusterIPs"`
 		} `json:"spec"`
 	}
-	items, ok := listAll[svc](ctx, r, "/api/v1/services")
+	items, ok := listAll[svc](ctx, r, "/api/v1/services", "")
 	if !ok {
 		return nil
 	}
@@ -374,13 +404,25 @@ func (r *resolver) enrich(e *api.Entry) {
 	r.trackPending(e)
 }
 
+// setByIP publishes a freshly built IP map. The previous snapshot stays valid
+// for any reader still holding it — nothing mutates a published map.
+func (r *resolver) setByIP(m map[string]ref) { r.byIP.Store(&m) }
+
+// ipRef looks ip up in the current snapshot.
+func (r *resolver) ipRef(ip string) (ref, bool) {
+	m := r.byIP.Load()
+	if m == nil {
+		return ref{}, false // never published (zero-value resolver in a test)
+	}
+	rf, ok := (*m)[ip]
+	return rf, ok
+}
+
 func (r *resolver) enrichEndpoint(ep *api.Endpoint) {
 	if ep.IP == "" {
 		return
 	}
-	r.mu.RLock()
-	rf, ok := r.byIP[ep.IP]
-	r.mu.RUnlock()
+	rf, ok := r.ipRef(ep.IP)
 	if !ok {
 		return
 	}
@@ -411,14 +453,23 @@ func hasUnresolvedEntry(e *api.Entry) bool {
 // goroutine still exclusively owns e; the registry only ever *reads* e's fields
 // afterwards (retryPending copies before enriching), so retaining the pointer is
 // safe against store.go's immutable-after-add contract. A fully resolved entry
-// is dropped from the registry instead.
+// has nothing to track.
 func (r *resolver) trackPending(e *api.Entry) {
-	r.pmu.Lock()
-	defer r.pmu.Unlock()
+	// Checked *before* taking pmu, which is the only exclusive lock the ingest
+	// path touches (and so the only hard serialisation point between concurrent
+	// worker-connection goroutines). In a cluster with working enrichment the
+	// overwhelming majority of entries resolve at ingest and return right here,
+	// never contending. The lock used to be taken unconditionally for a
+	// delete(pending, e.ID) that can never hit: entry IDs are unique monotonic
+	// counters and enrich() runs exactly once per entry, so an already-resolved
+	// entry was never inserted in the first place. (And were an ID ever reused,
+	// retryPending drops a tracked entry as soon as it fully resolves, so the
+	// registry still self-heals.)
 	if !hasUnresolvedEntry(e) {
-		delete(r.pending, e.ID) // resolved at ingest (or re-seen): forget it
 		return
 	}
+	r.pmu.Lock()
+	defer r.pmu.Unlock()
 	if r.pending == nil {
 		r.pending = map[string]*pendingResolve{}
 	}
