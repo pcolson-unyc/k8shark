@@ -1358,7 +1358,7 @@ func acquireGzipReader(r io.Reader) (*gzip.Reader, error) {
 }
 
 func releaseGzipReader(gr *gzip.Reader) {
-	gr.Close() // no-op for resources, but keep the original Close-before-reuse
+	_ = gr.Close() // no-op for resources, but keep the original Close-before-reuse
 	gzipReaderPool.Put(gr)
 }
 
