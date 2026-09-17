@@ -927,3 +927,18 @@ func TestNewOperatorsRejectUnknownField(t *testing.T) {
 		}
 	}
 }
+
+func TestNumericGetterPreservesMissingAndZeroSemantics(t *testing.T) {
+	e := &api.Entry{Response: api.Payload{MySQL: &api.MySQLDetail{ErrorCode: 0}}}
+	pred, err := CompileFilter(`mysql.error > 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pred(e) {
+		t.Fatal("mysql.error zero sentinel should remain missing")
+	}
+	e.Response.MySQL.ErrorCode = 2
+	if !pred(e) {
+		t.Fatal("populated mysql.error should compare numerically")
+	}
+}
