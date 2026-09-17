@@ -63,6 +63,8 @@ type TLSRecord struct {
 	SrcIP, DstIP     string
 	SrcPort, DstPort uint16
 
+	// Data ownership transfers to the consumer when sent on Records. The source
+	// must never mutate or reuse this backing buffer after sending the record.
 	Data []byte
 
 	// Lagged marks a data-less tombstone: backpressure forced the drop of one

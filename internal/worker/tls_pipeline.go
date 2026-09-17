@@ -285,14 +285,11 @@ func (st *tlsStream) feed(rec ebpf.TLSRecord) {
 	if len(rec.Data) == 0 {
 		return
 	}
-	// Copy: the eBPF ring buffer may reuse rec.Data's backing array once this
-	// callback returns, so the chanPipe must own an independent copy.
-	data := append([]byte(nil), rec.Data...)
 	switch rec.Direction {
 	case ebpf.TLSDirWrite:
-		st.write.push(data)
+		st.write.push(rec.Data)
 	case ebpf.TLSDirRead:
-		st.read.push(data)
+		st.read.push(rec.Data)
 	}
 }
 

@@ -12,8 +12,9 @@ import (
 	"github.com/pablocolson/k8shark/pkg/api"
 )
 
-// fakeTLSSource is a canned ebpf.Source: the test pushes TLSRecords directly
-// on ch instead of a real eBPF ring buffer.
+// fakeTLSSource is a canned ebpf.Source: the test pushes TLSRecords directly.
+// Like the production source, sending a record transfers ownership of Data;
+// the sender must never mutate or reuse its backing buffer afterward.
 type fakeTLSSource struct {
 	ch     chan ebpf.TLSRecord
 	closed chan struct{}
@@ -21,6 +22,30 @@ type fakeTLSSource struct {
 
 func newFakeTLSSource() *fakeTLSSource {
 	return &fakeTLSSource{ch: make(chan ebpf.TLSRecord, 8), closed: make(chan struct{})}
+}
+
+func TestTLSFeedTakesOwnershipWithoutCopy(t *testing.T) {
+	st := &tlsStream{write: newChanPipe(1), read: newChanPipe(1)}
+	data := []byte("hello")
+	st.feed(ebpf.TLSRecord{Direction: ebpf.TLSDirWrite, Data: data})
+	queued := <-st.write.ch
+	if &queued[0] != &data[0] {
+		t.Fatal("feed copied transferred Data")
+	}
+	if string(queued) != "hello" {
+		t.Fatalf("queued data = %q, want hello", queued)
+	}
+}
+
+func BenchmarkTLSStreamFeed(b *testing.B) {
+	st := &tlsStream{write: newChanPipe(1), read: newChanPipe(1)}
+	data := make([]byte, 1024)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		st.feed(ebpf.TLSRecord{Direction: ebpf.TLSDirWrite, Data: data})
+		<-st.write.ch
+	}
 }
 
 func (f *fakeTLSSource) Records() <-chan ebpf.TLSRecord { return f.ch }

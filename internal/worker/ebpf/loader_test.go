@@ -47,6 +47,20 @@ func TestDecodeEventWithTuple(t *testing.T) {
 	}
 }
 
+func TestDecodeEventCopiesInputData(t *testing.T) {
+	raw := make([]byte, eventOffData+5)
+	binary.LittleEndian.PutUint32(raw[eventOffDataLen:], 5)
+	copy(raw[eventOffData:], []byte("hello"))
+	rec, err := decodeEvent(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[eventOffData] = 'X'
+	if string(rec.Data) != "hello" {
+		t.Fatalf("decoded data changed after input reuse: %q", rec.Data)
+	}
+}
+
 // TestDecodeEventWithIPv6Tuple mirrors TestDecodeEventWithTuple for an
 // AF_INET6 tuple (CAP-7): the full 16-byte saddr/daddr must be read, not just
 // the first 4 bytes as for AF_INET.
