@@ -434,7 +434,23 @@ func (p *pipeline) emitPair(key string, pr *pendingReq, resp api.Payload, status
 
 // --- TCP dispatch -----------------------------------------------------------
 
-type tcpStreamFactory struct{ p *pipeline }
+type tcpStreamFactory struct {
+	p             *pipeline
+	liveStreams   *atomic.Int64
+	streamCreates *atomic.Uint64
+}
+
+type trackedTCPStream struct {
+	tcpreader.ReaderStream
+	liveStreams *atomic.Int64
+}
+
+func (s *trackedTCPStream) ReassemblyComplete() {
+	s.ReaderStream.ReassemblyComplete()
+	if s.liveStreams != nil {
+		s.liveStreams.Add(-1)
+	}
+}
 
 func (f *tcpStreamFactory) New(netFlow, transport gopacket.Flow) tcpassembly.Stream {
 	r := tcpreader.NewReaderStream()
@@ -442,8 +458,15 @@ func (f *tcpStreamFactory) New(netFlow, transport gopacket.Flow) tcpassembly.Str
 	// tcpreader.DataLost error from Read instead of silently splicing over the
 	// hole — see lossReader for how that is turned into a clean truncation.
 	r.LossErrors = true
-	go f.p.consumeStream(netFlow, transport, &r)
-	return &r
+	if f.liveStreams != nil {
+		f.liveStreams.Add(1)
+	}
+	if f.streamCreates != nil {
+		f.streamCreates.Add(1)
+	}
+	stream := &trackedTCPStream{ReaderStream: r, liveStreams: f.liveStreams}
+	go f.p.consumeStream(netFlow, transport, stream)
+	return stream
 }
 
 // consumeStream routes one direction of an AF_PACKET-discovered TCP connection
