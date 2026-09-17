@@ -300,21 +300,22 @@ func (s *Server) stopExporter() {
 // plus its self-reported counters, kept after disconnect so "worker was here,
 // went away 2 min ago" is answerable during an incident.
 type workerInfo struct {
-	Node          string    `json:"node"`
-	Version       string    `json:"version,omitempty"`
-	Connected     bool      `json:"connected"`
-	ConnectedAt   time.Time `json:"connectedAt"`
-	LastSeen      time.Time `json:"lastSeen"`
-	Entries       int64     `json:"entries"`       // entries the hub received from this worker
-	Dropped       uint64    `json:"dropped"`       // worker-reported sink-buffer drops
-	CaptureLive   bool      `json:"captureLive"`   // AF_PACKET source active on the worker
-	CaptureTLS    bool      `json:"captureTls"`    // eBPF TLS capture active on the worker
-	CapturePaused bool      `json:"capturePaused"` // hub told this worker to stop turning capture into entries
-	RingPackets   uint64    `json:"ringPackets"`   // AF_PACKET kernel ring: cumulative packets delivered
-	RingDrops     uint64    `json:"ringDrops"`     // AF_PACKET kernel ring: cumulative packets dropped before userspace saw them
-	FlowsEvicted  uint64    `json:"flowsEvicted"`  // generic L4 flows dropped by the worker's maxFlows cap
-	TLSLagDrops   uint64    `json:"tlsLagDrops"`   // eBPF TLS streams truncated after a backpressure drop
-	TCPLossEvents uint64    `json:"tcpLossEvents"` // AF_PACKET TCP directions truncated after a lost segment (FIFO desync guard)
+	Node           string    `json:"node"`
+	Version        string    `json:"version,omitempty"`
+	Connected      bool      `json:"connected"`
+	ConnectedAt    time.Time `json:"connectedAt"`
+	LastSeen       time.Time `json:"lastSeen"`
+	Entries        int64     `json:"entries"`       // entries the hub received from this worker
+	Dropped        uint64    `json:"dropped"`       // worker-reported sink-buffer drops
+	CaptureLive    bool      `json:"captureLive"`   // AF_PACKET source active on the worker
+	CaptureTLS     bool      `json:"captureTls"`    // eBPF TLS capture active on the worker
+	CapturePaused  bool      `json:"capturePaused"` // hub told this worker to stop turning capture into entries
+	RingPackets    uint64    `json:"ringPackets"`   // AF_PACKET kernel ring: cumulative packets delivered
+	RingDrops      uint64    `json:"ringDrops"`     // AF_PACKET kernel ring: cumulative packets dropped before userspace saw them
+	FlowsEvicted   uint64    `json:"flowsEvicted"`  // generic L4 flows dropped by the worker's maxFlows cap
+	TLSLagDrops    uint64    `json:"tlsLagDrops"`   // eBPF TLS streams truncated after a backpressure drop
+	TCPLossEvents  uint64    `json:"tcpLossEvents"` // AF_PACKET TCP directions truncated after a lost segment (FIFO desync guard)
+	TLSBudgetDrops uint64    `json:"tlsBudgetDrops,omitempty"`
 }
 
 // workerEntry is the registry's internal row. The cold fields live in info,
@@ -471,6 +472,7 @@ func (s *Server) handleWorker(w http.ResponseWriter, r *http.Request) {
 					wi.RingDrops = ws.RingDrops
 					wi.FlowsEvicted = ws.FlowsEvicted
 					wi.TLSLagDrops = ws.TLSLagDrops
+					wi.TLSBudgetDrops = ws.TLSBudgetDrops
 					wi.TCPLossEvents = ws.TCPLossEvents
 					wi.LastSeen = time.Now()
 				})
@@ -1399,6 +1401,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(&b, "k8shark_worker_tls_lag_drops_total{node=%q} %d\n", wi.Node, wi.TLSLagDrops)
 		}
 		fmt.Fprintf(&b, "# HELP k8shark_worker_tcp_loss_events_total AF_PACKET TCP stream directions truncated after a lost segment (FIFO pairing desync guard).\n")
+		fmt.Fprintf(&b, "# HELP k8shark_worker_tls_budget_drops_total TLS records rejected at stream or payload limits.\n# TYPE k8shark_worker_tls_budget_drops_total counter\n")
+		for _, wi := range workers {
+			fmt.Fprintf(&b, "k8shark_worker_tls_budget_drops_total{node=%q} %d\n", wi.Node, wi.TLSBudgetDrops)
+		}
 		fmt.Fprintf(&b, "# TYPE k8shark_worker_tcp_loss_events_total counter\n")
 		for _, wi := range workers {
 			fmt.Fprintf(&b, "k8shark_worker_tcp_loss_events_total{node=%q} %d\n", wi.Node, wi.TCPLossEvents)

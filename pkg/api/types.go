@@ -377,6 +377,8 @@ type WorkerStats struct {
 	// backpressure forced the drop of one of their interior chunks — the
 	// stream is closed with a clean truncation instead of being misparsed.
 	TLSLagDrops uint64 `json:"tlsLagDrops,omitempty"`
+	// TLSBudgetDrops counts records rejected at the stream or payload budget.
+	TLSBudgetDrops uint64 `json:"tlsBudgetDrops,omitempty"`
 	// TCPLossEvents counts AF_PACKET TCP stream directions truncated after a
 	// lost segment surfaced as tcpreader.DataLost (LossErrors): the
 	// connection's pending requests are purged and the direction dropped,

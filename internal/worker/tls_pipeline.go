@@ -7,12 +7,48 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pablocolson/k8shark/internal/worker/ebpf"
 	"github.com/pablocolson/k8shark/pkg/api"
 )
+
+const (
+	maxTLSStreams           = 4096
+	maxTLSQueuedBytes int64 = 64 << 20
+)
+
+type tlsByteBudget struct {
+	mu            sync.Mutex
+	used          int64
+	limit         int64
+	drops         atomic.Uint64
+	reportedDrops *atomic.Uint64
+}
+
+func newTLSByteBudget(limit int64) *tlsByteBudget {
+	if limit <= 0 {
+		limit = maxTLSQueuedBytes
+	}
+	return &tlsByteBudget{limit: limit}
+}
+
+func (b *tlsByteBudget) reserve(n int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.used+int64(n) > b.limit {
+		b.drops.Add(1)
+		if b.reportedDrops != nil {
+			b.reportedDrops.Add(1)
+		}
+		return false
+	}
+	b.used += int64(n)
+	return true
+}
+func (b *tlsByteBudget) release(n int) { b.mu.Lock(); b.used -= int64(n); b.mu.Unlock() }
 
 // startTLSCapture wires the eBPF TLS uprobe layer (internal/worker/ebpf) into
 // the given pipeline, running it alongside AF_PACKET. It never blocks and
@@ -71,6 +107,12 @@ const tlsIdleTimeout = 30 * time.Second
 // recognized as such until Phase 2b supplies real ports, or a content-sniff
 // dispatch is added ahead of it.
 func (p *pipeline) consumeTLS(ctx context.Context, src ebpf.Source) {
+	budget := newTLSByteBudget(maxTLSQueuedBytes)
+	budget.reportedDrops = &p.sink.tlsBudgetDrops
+	p.consumeTLSBounded(ctx, src, maxTLSStreams, budget)
+}
+
+func (p *pipeline) consumeTLSBounded(ctx context.Context, src ebpf.Source, streamLimit int, budget *tlsByteBudget) {
 	streams := map[uint64]*tlsStream{}
 	gc := time.NewTicker(15 * time.Second)
 	defer gc.Stop()
@@ -113,7 +155,11 @@ func (p *pipeline) consumeTLS(ctx context.Context, src ebpf.Source) {
 			}
 			st := streams[rec.ConnID]
 			if st == nil {
-				st = newTLSStream(p, rec)
+				if len(streams) >= streamLimit {
+					p.sink.tlsBudgetDrops.Add(1)
+					continue
+				}
+				st = newTLSStream(p, rec, budget)
 				streams[rec.ConnID] = st
 			}
 			st.lastSeen = time.Now()
@@ -141,7 +187,7 @@ type tlsStream struct {
 	lastSeen    time.Time
 }
 
-func newTLSStream(p *pipeline, rec ebpf.TLSRecord) *tlsStream {
+func newTLSStream(p *pipeline, rec ebpf.TLSRecord, budget *tlsByteBudget) *tlsStream {
 	// The connID is fixed once, at stream creation, and shared by both
 	// directions so request/response always pair — even though the tcp_*
 	// kprobes may resolve the real 4-tuple only after some records. Phase 2b:
@@ -164,9 +210,9 @@ func newTLSStream(p *pipeline, rec ebpf.TLSRecord) *tlsStream {
 			dstPort: int(rec.ConnID % 65536),
 		}
 	}
-	st := &tlsStream{write: newChanPipe(64), read: newChanPipe(64)}
-	go p.consumeSniffedID(c, st.write, true) // write = data sent by the process = request side
-	go p.consumeSniffedID(c, st.read, false) // read  = data received        = response side
+	st := &tlsStream{write: newChanPipe(64, budget), read: newChanPipe(64, budget)}
+	go func() { defer st.write.discard(); p.consumeSniffedID(c, st.write, true) }()
+	go func() { defer st.read.discard(); p.consumeSniffedID(c, st.read, false) }()
 	return st
 }
 
@@ -313,14 +359,22 @@ func (st *tlsStream) close() {
 // prefix beats corruption. (sink.go's emit() can drop whole entries because
 // each is self-contained; a stream chunk is not.)
 type chanPipe struct {
-	ch     chan []byte
-	closed chan struct{}
-	lagged atomic.Bool
-	buf    []byte
+	mu        sync.Mutex
+	ch        chan []byte
+	closed    chan struct{}
+	done      bool
+	lagged    atomic.Bool
+	buf       []byte
+	bufCharge int
+	budget    *tlsByteBudget
 }
 
-func newChanPipe(size int) *chanPipe {
-	return &chanPipe{ch: make(chan []byte, size), closed: make(chan struct{})}
+func newChanPipe(size int, budget ...*tlsByteBudget) *chanPipe {
+	var b *tlsByteBudget
+	if len(budget) > 0 {
+		b = budget[0]
+	}
+	return &chanPipe{ch: make(chan []byte, size), closed: make(chan struct{}), budget: b}
 }
 
 // push appends a chunk without ever blocking. If the buffer is full the pipe
@@ -328,18 +382,52 @@ func newChanPipe(size int) *chanPipe {
 // desync the stream parser); Read then delivers EOF once the buffered chunks
 // drain. Single-writer: only the consumeTLS goroutine calls push per pipe.
 func (c *chanPipe) push(b []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.done {
+		return
+	}
 	if c.lagged.Load() {
+		return
+	}
+	if c.budget != nil && !c.budget.reserve(len(b)) {
+		c.lagged.Store(true)
+		if !c.done {
+			c.done = true
+			close(c.closed)
+		}
 		return
 	}
 	select {
 	case c.ch <- b:
 	default:
+		if c.budget != nil {
+			c.budget.release(len(b))
+		}
 		c.lagged.Store(true)
+		c.done = true
+		close(c.closed)
 	}
 }
 
 func (c *chanPipe) Read(p []byte) (int, error) {
-	for len(c.buf) == 0 {
+	for {
+		c.mu.Lock()
+		if len(c.buf) > 0 {
+			n := copy(p, c.buf)
+			if n == len(c.buf) {
+				if c.budget != nil {
+					c.budget.release(c.bufCharge)
+				}
+				c.buf = nil
+				c.bufCharge = 0
+			} else {
+				c.buf = c.buf[n:]
+			}
+			c.mu.Unlock()
+			return n, nil
+		}
+		c.mu.Unlock()
 		// Prefer draining a buffered chunk over observing lag/close, so the
 		// already-enqueued prefix is always delivered in full.
 		select {
@@ -347,7 +435,9 @@ func (c *chanPipe) Read(p []byte) (int, error) {
 			if !ok {
 				return 0, io.EOF
 			}
-			c.buf = b
+			c.mu.Lock()
+			c.buf, c.bufCharge = b, len(b)
+			c.mu.Unlock()
 			continue
 		default:
 		}
@@ -361,22 +451,60 @@ func (c *chanPipe) Read(p []byte) (int, error) {
 			if !ok {
 				return 0, io.EOF
 			}
-			c.buf = b
+			c.mu.Lock()
+			c.buf, c.bufCharge = b, len(b)
+			c.mu.Unlock()
 		case <-c.closed:
-			return 0, io.EOF
+			// A writer may have queued a final chunk before Close won the
+			// blocking select. Deliver that prefix before returning EOF.
+			select {
+			case b := <-c.ch:
+				c.mu.Lock()
+				c.buf, c.bufCharge = b, len(b)
+				c.mu.Unlock()
+			default:
+				return 0, io.EOF
+			}
 		}
 	}
-	n := copy(p, c.buf)
-	c.buf = c.buf[n:]
-	return n, nil
 }
 
 // Close unblocks any in-progress or future Read with io.EOF. Safe to call
 // more than once.
 func (c *chanPipe) Close() {
-	select {
-	case <-c.closed:
-	default:
+	c.mu.Lock()
+	if c.done {
+		c.mu.Unlock()
+		return
+	}
+	c.done = true
+	close(c.closed)
+	c.mu.Unlock()
+}
+
+// discard is called by the reader owner after its parser returns.
+func (c *chanPipe) discard() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done {
+		c.done = true
 		close(c.closed)
+	}
+	if c.budget != nil {
+		if c.bufCharge > 0 {
+			c.budget.release(c.bufCharge)
+		}
+	}
+	c.buf = nil
+	c.bufCharge = 0
+	for {
+		select {
+		case b := <-c.ch:
+			if c.budget != nil {
+				c.budget.release(len(b))
+			}
+		default:
+			return
+		}
 	}
 }
