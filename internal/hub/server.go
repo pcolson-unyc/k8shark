@@ -74,15 +74,18 @@ type Options struct {
 
 // Server is the hub. Construct with New and start with Run.
 type Server struct {
-	store        *store
-	log          *slog.Logger
-	upgrader     websocket.Upgrader
-	apiToken     string
-	workerToken  string
-	adminToken   string
-	allowOrigins []string
-	tlsCert      string
-	tlsKey       string
+	aggMu         sync.Mutex
+	aggCache      map[string]aggCacheEntry
+	aggCacheBytes int
+	store         *store
+	log           *slog.Logger
+	upgrader      websocket.Upgrader
+	apiToken      string
+	workerToken   string
+	adminToken    string
+	allowOrigins  []string
+	tlsCert       string
+	tlsKey        string
 
 	mu           sync.RWMutex
 	frontClients map[*frontClient]struct{}
@@ -117,6 +120,51 @@ type Server struct {
 
 	statsHistMu sync.RWMutex
 	statsHist   []api.StatsPoint // rolling throughput history, capped at statsHistoryCap
+}
+type aggCacheEntry struct {
+	body []byte
+	at   time.Time
+}
+
+const aggCacheTTL = time.Second
+
+func (s *Server) cachedAgg(key string, build func() ([]byte, error)) ([]byte, error) {
+	// Serialize aggregate builds across keys as well as coalescing identical
+	// requests. Ingestion only shares the store's brief snapshot lock, not this
+	// cache lock. Bodies are immutable after insertion.
+	s.aggMu.Lock()
+	defer s.aggMu.Unlock()
+	now := time.Now()
+	if s.aggCache != nil {
+		if v, ok := s.aggCache[key]; ok && now.Sub(v.at) < aggCacheTTL {
+			return v.body, nil
+		}
+	}
+	b, err := build()
+	if err != nil || len(b) > 4<<20 {
+		return b, err
+	}
+	if s.aggCache == nil {
+		s.aggCache = map[string]aggCacheEntry{}
+	}
+	if old, ok := s.aggCache[key]; ok {
+		s.aggCacheBytes -= len(old.body)
+		delete(s.aggCache, key)
+	}
+	for (len(s.aggCache) >= 32 || s.aggCacheBytes+len(b) > 4<<20) && len(s.aggCache) > 0 {
+		for k := range s.aggCache {
+			s.aggCacheBytes -= len(s.aggCache[k].body)
+			delete(s.aggCache, k)
+			break
+		}
+	}
+	s.aggCache[key] = aggCacheEntry{b, now}
+	s.aggCacheBytes += len(b)
+	return b, nil
+}
+func writeCachedJSON(w http.ResponseWriter, b []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(b)
 }
 
 // statsHistoryCap bounds the rolling stats history: at the statsLoop's 2s
@@ -1239,16 +1287,20 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	entries := s.store.recent(s.store.capacity, pred)
-	groups := summarize(entries, groupBy)
-	if len(groups) > limit {
-		groups = groups[:limit]
-	}
-	writeJSON(w, map[string]any{
-		"groupBy": groupBy,
-		"total":   len(entries),
-		"groups":  groups,
+	key := "summary:" + r.URL.RequestURI()
+	body, err := s.cachedAgg(key, func() ([]byte, error) {
+		entries := s.store.recent(s.store.capacity, pred)
+		groups := summarize(entries, groupBy)
+		if len(groups) > limit {
+			groups = groups[:limit]
+		}
+		return json.Marshal(map[string]any{"groupBy": groupBy, "total": len(entries), "groups": groups})
 	})
+	if err != nil {
+		http.Error(w, "encode summary: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeCachedJSON(w, body)
 }
 
 // handleTimeline serves GET /api/timeline?bucket=&filter=&since=&until=,
@@ -1296,10 +1348,16 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	entries := s.store.recent(s.store.capacity, pred)
-	writeJSON(w, map[string]any{
-		"edges": serviceGraph(entries, r.URL.Query().Get("focus")),
+	key := "graph:" + r.URL.RequestURI()
+	body, err := s.cachedAgg(key, func() ([]byte, error) {
+		entries := s.store.recent(s.store.capacity, pred)
+		return json.Marshal(map[string]any{"edges": serviceGraph(entries, r.URL.Query().Get("focus"))})
 	})
+	if err != nil {
+		http.Error(w, "encode graph: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeCachedJSON(w, body)
 }
 
 // handleWorkers serves GET /api/workers: every worker ever seen (connected or
