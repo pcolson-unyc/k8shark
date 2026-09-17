@@ -64,12 +64,13 @@ type libTarget struct {
 // denied for a pid outside our pid namespace) — those are skipped and logged
 // at debug level; discoverTargets only returns an error if procRoot itself is
 // unreadable.
-func discoverTargets(procRoot string, log *slog.Logger) ([]libTarget, error) {
+func discoverTargets(procRoot string, log *slog.Logger) ([]libTarget, bool, error) {
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", procRoot, err)
+		return nil, false, fmt.Errorf("read %s: %w", procRoot, err)
 	}
 	var targets []libTarget
+	complete := true
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil || pid <= 0 {
@@ -77,12 +78,13 @@ func discoverTargets(procRoot string, log *slog.Logger) ([]libTarget, error) {
 		}
 		ts, err := scanPidMaps(procRoot, pid)
 		if err != nil {
+			complete = false
 			log.Debug("ebpf: skip pid (maps unreadable)", "pid", pid, "err", err)
 			continue
 		}
 		targets = append(targets, ts...)
 	}
-	return targets, nil
+	return targets, complete, nil
 }
 
 // scanPidMaps parses one process's /proc/<pid>/maps for TLS library mappings.

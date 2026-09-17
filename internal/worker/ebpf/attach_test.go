@@ -100,9 +100,12 @@ func TestDiscoverTargetsWalksAllPids(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	targets, err := discoverTargets(root, discardTestLogger())
+	targets, complete, err := discoverTargets(root, discardTestLogger())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !complete {
+		t.Fatal("scan unexpectedly incomplete")
 	}
 	pids := map[int]int{}
 	for _, tg := range targets {
