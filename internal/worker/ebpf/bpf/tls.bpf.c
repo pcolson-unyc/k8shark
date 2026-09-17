@@ -34,6 +34,7 @@ typedef unsigned long size_t;
 
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_RINGBUF 27
+#define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_ANY 0
 
 #include <bpf/bpf_helpers.h>
@@ -66,6 +67,7 @@ struct pt_regs {
 char __license[] SEC("license") = "GPL";
 
 #define MAX_DATA 16384
+#define EVENT_FLAG_LAGGED 0x80000000U
 #define DIR_WRITE 1
 #define DIR_READ 2
 #define AF_INET 2
@@ -141,6 +143,13 @@ struct {
 	__uint(max_entries, 16 * 1024 * 1024);
 } events SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct event);
+} scratch SEC(".maps");
+
 // read_ctx is what an SSL_read*/SSL_write_ex entry probe stashes for its
 // uretprobe to finish the job with. written_ptr is 0 for plain SSL_read,
 // whose byte count is the return value instead of an out-param.
@@ -210,17 +219,12 @@ static __always_inline void record_tuple(struct sock *sk)
 	bpf_map_update_elem(&tuples, &id, &t, BPF_ANY);
 }
 
-static __always_inline void emit(__u64 ssl, __u8 dir, const void *buf, __u32 len)
+// Populate the fixed header in per-CPU scratch memory. Output below includes
+// only this header and the captured payload, without unused array capacity.
+// The matching Go decoder handles the high-bit loss marker used for explicit
+// stream termination; field offsets stay unchanged.
+static __always_inline void fill_event(struct event *e, __u64 ssl, __u8 dir)
 {
-	if (len == 0)
-		return;
-	if (len > MAX_DATA)
-		len = MAX_DATA;
-
-	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-	if (!e)
-		return;
-
 	__u64 id = bpf_get_current_pid_tgid();
 	e->pid = id >> 32;
 	e->tid = (__u32)id;
@@ -243,24 +247,46 @@ static __always_inline void emit(__u64 ssl, __u8 dir, const void *buf, __u32 len
 		e->dport = 0;
 		e->family = 0;
 	}
+}
 
-	// Bound the copy length with an OPAQUE mask. A plain C `if (len > MAX_DATA)
-	// len = MAX_DATA` / `len &= (MAX_DATA-1)` gets optimized by clang such that
-	// the verifier loses the lower bound at the bpf_probe_read_user call ("R2
-	// min value is negative"). The inline-asm AND emits a real instruction
-	// clang can't fold away, so the verifier proves rlen ∈ [0, MAX_DATA-1].
-	// (MAX_DATA is 2^14, so a buffer that is an exact multiple of MAX_DATA maps
-	// to 0 and is skipped — harmless, plaintext is truncated downstream anyway.
-	// This is the standard idiom for variable-length uprobe copies.)
-	__u32 rlen = len;
+// emit_chunk copies one contiguous piece.  A failed user read is represented
+// by a data-less tombstone, allowing the Go consumer to close the stream
+// instead of parsing across an interior hole.
+static __always_inline int emit_chunk(__u64 ssl, __u8 dir, const void *buf, __u32 len, __u32 terminal)
+{
+	__u32 key = 0;
+	struct event *e = bpf_map_lookup_elem(&scratch, &key);
+	if (!e)
+		return 0;
+	fill_event(e, ssl, dir);
+
+	// Keep a verifier-visible upper bound without the old exact-power-of-two
+	// hole: mask len-1, then add one, so 16384 remains 16384 rather than zero.
+	__u32 rlen = len - 1;
 	asm volatile("%0 &= %1" : "+r"(rlen) : "i"(MAX_DATA - 1));
-	e->data_len = rlen;
-
+	rlen++;
+	e->data_len = rlen | terminal;
 	if (bpf_probe_read_user(e->data, rlen, buf) < 0) {
-		bpf_ringbuf_discard(e, 0);
-		return;
+		e->data_len = EVENT_FLAG_LAGGED;
+		bpf_ringbuf_output(&events, e, 58, 0);
+		return -1;
 	}
-	bpf_ringbuf_submit(e, 0);
+	bpf_ringbuf_output(&events, e, 58 + rlen, 0);
+	return 1;
+}
+
+static __always_inline void emit(__u64 ssl, __u8 dir, const void *buf, __u32 len)
+{
+	if (len == 0)
+		return;
+	// Capture one bounded chunk.  Larger TLS callbacks are explicitly
+	// terminated with a tombstone rather than silently feeding a partial
+	// interior stream to the parser; this keeps the program small and verifier
+	// compatible on older kernels.
+	__u32 n = len > MAX_DATA ? MAX_DATA : len;
+	// Mark the bounded event itself terminal when bytes were omitted.  A
+	// second reservation would be another possible loss point under pressure.
+	(void)emit_chunk(ssl, dir, buf, n, len > MAX_DATA ? EVENT_FLAG_LAGGED : 0);
 }
 
 // --- SSL_write(SSL *ssl, const void *buf, int num) -------------------------

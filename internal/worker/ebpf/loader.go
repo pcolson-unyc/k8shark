@@ -34,6 +34,8 @@ const (
 	eventOffFamily    = 56
 	eventOffDirection = 57
 	eventOffData      = 58
+	eventFlagLagged   = uint32(1 << 31)
+	eventDataMask     = ^eventFlagLagged
 )
 
 // Linux AF_* constants (bits/socket.h) — matches AF_INET/AF_INET6 in
@@ -48,6 +50,8 @@ func decodeEvent(raw []byte) (TLSRecord, error) {
 		return TLSRecord{}, fmt.Errorf("ebpf: short ring buffer record (%d bytes)", len(raw))
 	}
 	dataLen := binary.LittleEndian.Uint32(raw[eventOffDataLen:])
+	lagged := dataLen&eventFlagLagged != 0
+	dataLen &= eventDataMask
 	end := eventOffData + int(dataLen)
 	if end > len(raw) {
 		end = len(raw) // defensive: never index past what the kernel actually gave us
@@ -57,6 +61,7 @@ func decodeEvent(raw []byte) (TLSRecord, error) {
 		TID:       binary.LittleEndian.Uint32(raw[eventOffTID:]),
 		ConnID:    binary.LittleEndian.Uint64(raw[eventOffSSLCtx:]),
 		Direction: TLSDirection(raw[eventOffDirection]),
+		Lagged:    lagged,
 		SrcPort:   binary.LittleEndian.Uint16(raw[eventOffSPort:]),
 		DstPort:   binary.LittleEndian.Uint16(raw[eventOffDPort:]),
 	}
@@ -81,7 +86,7 @@ func decodeEvent(raw []byte) (TLSRecord, error) {
 			rec.DstIP = ipv6String(da)
 		}
 	}
-	if end > eventOffData {
+	if end > eventOffData && !lagged {
 		rec.Data = append([]byte(nil), raw[eventOffData:end]...)
 	}
 	return rec, nil
@@ -209,6 +214,21 @@ func (s *linuxSource) Attach() error {
 // stale one resuming misparsed, both strictly better than unbounded growth.
 const maxLaggedConns = 4096
 
+// A full output channel must leave the tombstone pending for the next event.
+func forwardLoss(out chan TLSRecord, lagged map[uint64]bool, ev TLSRecord) {
+	if lagged[ev.ConnID] {
+		return
+	}
+	ev.Data = nil
+	ev.Lagged = true
+	lagged[ev.ConnID] = false
+	select {
+	case out <- ev:
+		lagged[ev.ConnID] = true
+	default:
+	}
+}
+
 // drainLoop copies ring buffer records into s.out. On backpressure it drops
 // the oldest buffered record — but that record is an interior chunk of some
 // connection's byte stream, exactly the mid-stream hole chanPipe
@@ -238,16 +258,24 @@ func (s *linuxSource) drainLoop() {
 			s.cfg.Log.Debug("ebpf: drop malformed record", "err", err)
 			continue
 		}
+		if ev.Lagged {
+			// A kernel-side read/truncation tombstone has the same semantics as
+			// a locally evicted record: forward it once, then suppress the tail
+			// so a new stream cannot be built across a known byte hole.
+			if sent, seen := lagged[ev.ConnID]; seen && sent {
+				continue
+			}
+			if len(lagged) >= maxLaggedConns {
+				lagged = map[uint64]bool{}
+			}
+			forwardLoss(s.out, lagged, ev)
+			continue
+		}
 		if sent, isLagged := lagged[ev.ConnID]; isLagged {
 			if sent {
 				continue // stream already truncated; discard the tail
 			}
-			tomb := TLSRecord{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID, Lagged: true}
-			select {
-			case s.out <- tomb:
-				lagged[ev.ConnID] = true
-			default:
-			}
+			forwardLoss(s.out, lagged, ev)
 			continue
 		}
 		select {
