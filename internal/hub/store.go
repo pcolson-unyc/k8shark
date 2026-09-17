@@ -13,11 +13,13 @@ import (
 // rolling aggregate counters. It is the hub's only source of truth for the REST
 // API and for replaying history to newly-connected front clients.
 type store struct {
-	mu       sync.RWMutex
-	buf      []*api.Entry
-	capacity int
-	next     int // write cursor into buf
-	full     bool
+	mu            sync.RWMutex
+	buf           []*api.Entry
+	capacity      int
+	next          int // write cursor into buf
+	live          int
+	byteBudget    int64
+	retainedBytes int64
 
 	// raw mirrors buf slot-for-slot with each entry's JSON, marshaled once in
 	// add (an entry is immutable after add — enrichment happens before). It
@@ -78,11 +80,16 @@ type rateBucket struct {
 // case a query really does return more.
 const resultPrealloc = 512
 
-func newStore(capacity int) *store {
+func newStore(capacity int, budgets ...int64) *store {
+	budget := int64(64 << 20)
+	if len(budgets) > 0 && budgets[0] > 0 {
+		budget = budgets[0]
+	}
 	return &store{
 		buf:        make([]*api.Entry, capacity),
 		raw:        make([][]byte, capacity),
 		capacity:   capacity,
+		byteBudget: budget,
 		byID:       map[string]*api.Entry{},
 		byProtocol: map[string]int64{},
 		byStatus:   map[string]int64{},
@@ -114,25 +121,49 @@ func (s *store) add(e *api.Entry) []byte {
 	now := s.now()
 
 	s.mu.Lock()
+	if int64(len(raw)) > s.byteBudget {
+		s.byProtocol[string(e.Protocol)]++
+		if e.Status != "" {
+			s.byStatus[e.Status]++
+		}
+		s.observeRate(e, now)
+		s.mu.Unlock()
+		s.facets.observe(e)
+		return raw
+	}
 
 	// Invariant: the slot index is chosen and *both* mirrors (buf and raw) are
 	// written within this single lock hold, so buf[i] and raw[i] can never
 	// come from two different adds. Readers walking the ring therefore always
 	// see an entry together with its own JSON — which is what lets the
 	// snapshot helpers below copy the pair out and filter off-lock.
-	if old := s.buf[s.next]; old != nil && s.byID[old.ID] == old {
+	if old := s.buf[s.next]; old != nil {
 		// Evict the entry currently in this slot from the id index before
 		// overwriting it (guarding against a same-id re-add having already
 		// replaced the mapping).
-		delete(s.byID, old.ID)
+		if s.byID[old.ID] == old {
+			delete(s.byID, old.ID)
+		}
+		s.retainedBytes -= int64(len(s.raw[s.next]))
+	} else {
+		s.live++
 	}
 	s.buf[s.next] = e
 	s.raw[s.next] = raw
+	s.retainedBytes += int64(len(raw))
 	s.byID[e.ID] = e
 
 	s.next = (s.next + 1) % s.capacity
-	if s.next == 0 {
-		s.full = true
+	for s.retainedBytes > s.byteBudget && s.live > 0 {
+		oldest := (s.next - s.live + s.capacity) % s.capacity
+		old := s.buf[oldest]
+		if old != nil && s.byID[old.ID] == old {
+			delete(s.byID, old.ID)
+		}
+		s.retainedBytes -= int64(len(s.raw[oldest]))
+		s.buf[oldest] = nil
+		s.raw[oldest] = nil
+		s.live--
 	}
 
 	s.byProtocol[string(e.Protocol)]++
@@ -182,10 +213,7 @@ func (s *store) observeRate(e *api.Entry, now time.Time) {
 // liveLen is how many ring slots currently hold an entry. Caller holds at
 // least RLock.
 func (s *store) liveLen() int {
-	if s.full {
-		return s.capacity
-	}
-	return s.next
+	return s.live
 }
 
 // snapshotEntries copies up to depth of the live ring's entry pointers,

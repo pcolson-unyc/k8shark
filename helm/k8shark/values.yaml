@@ -55,6 +55,7 @@ hub:
   # limits.memory around 3Gi, not the default 1Gi. Lowering worker.capture
   # .bodyBytes/.rawBytes shrinks bytes/entry and buys buffer depth for free.
   bufferSize: 0
+  bufferBytes: 0 # serialized history JSON byte budget (0 = 64MiB)
   # apiToken: when set, /api and the WebSocket endpoints require
   # `Authorization: Bearer <token>` (browser WebSockets can use a
   # `Sec-WebSocket-Protocol: bearer.<token>` subprotocol instead; ?token= also

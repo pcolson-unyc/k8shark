@@ -131,6 +131,9 @@ spec:
             {{- if .Values.hub.bufferSize }}
             - --buffer={{ .Values.hub.bufferSize }}
             {{- end }}
+            {{- if .Values.hub.bufferBytes }}
+            - --buffer-bytes={{ .Values.hub.bufferBytes }}
+            {{- end }}
             {{- if .Values.hub.tls.enabled }}
             - --tls-cert=/etc/k8shark/tls/tls.crt
             - --tls-key=/etc/k8shark/tls/tls.key
