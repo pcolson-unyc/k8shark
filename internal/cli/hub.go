@@ -25,6 +25,9 @@ func hubCmd() *cobra.Command {
 	var exportFile, exportWebhook string
 	var exportFileMaxBytes int64
 	var exportWebhookInterval time.Duration
+	var onDemandCapture bool
+	var captureNamespace, captureDaemonSet string
+	var captureDefaultDuration, captureMaxDuration time.Duration
 	cmd := &cobra.Command{
 		Use:   "hub",
 		Short: "Run the hub server (aggregates worker traffic, serves the API)",
@@ -33,6 +36,9 @@ func hubCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if bufferSize < 0 || bufferBytes < 0 {
 				return fmt.Errorf("--buffer and --buffer-bytes must be non-negative")
+			}
+			if onDemandCapture && (captureDefaultDuration <= 0 || captureMaxDuration <= 0 || captureDefaultDuration > captureMaxDuration) {
+				return fmt.Errorf("capture durations must be positive and default must not exceed maximum")
 			}
 			if apiToken == "" {
 				apiToken = os.Getenv("K8SHARK_API_TOKEN")
@@ -47,19 +53,24 @@ func hubCmd() *cobra.Command {
 				return fmt.Errorf("--tls-cert and --tls-key must be set together")
 			}
 			s := hub.New(log, hub.Options{
-				UIDir:                 uiDir,
-				APIToken:              apiToken,
-				WorkerToken:           workerToken,
-				AdminToken:            adminToken,
-				BufferSize:            bufferSize,
-				BufferBytes:           bufferBytes,
-				AllowedOrigins:        allowOrigins,
-				TLSCert:               tlsCert,
-				TLSKey:                tlsKey,
-				ExportFile:            exportFile,
-				ExportFileMaxBytes:    exportFileMaxBytes,
-				ExportWebhook:         exportWebhook,
-				ExportWebhookInterval: exportWebhookInterval,
+				UIDir:                  uiDir,
+				APIToken:               apiToken,
+				WorkerToken:            workerToken,
+				AdminToken:             adminToken,
+				BufferSize:             bufferSize,
+				BufferBytes:            bufferBytes,
+				AllowedOrigins:         allowOrigins,
+				TLSCert:                tlsCert,
+				TLSKey:                 tlsKey,
+				ExportFile:             exportFile,
+				ExportFileMaxBytes:     exportFileMaxBytes,
+				ExportWebhook:          exportWebhook,
+				ExportWebhookInterval:  exportWebhookInterval,
+				OnDemandCapture:        onDemandCapture,
+				CaptureNamespace:       captureNamespace,
+				CaptureDaemonSet:       captureDaemonSet,
+				CaptureDefaultDuration: captureDefaultDuration,
+				CaptureMaxDuration:     captureMaxDuration,
 			})
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
@@ -80,5 +91,10 @@ func hubCmd() *cobra.Command {
 	cmd.Flags().Int64Var(&exportFileMaxBytes, "export-file-max-bytes", 0, "rotate the export file past this size (0 = default)")
 	cmd.Flags().StringVar(&exportWebhook, "export-webhook", "", "also POST batches of entries (JSON array) to this URL")
 	cmd.Flags().DurationVar(&exportWebhookInterval, "export-webhook-interval", 0, "flush a partial webhook batch after this long (0 = default)")
+	cmd.Flags().BoolVar(&onDemandCapture, "on-demand-capture", false, "manage worker DaemonSet as expiring on-demand capture sessions")
+	cmd.Flags().StringVar(&captureNamespace, "capture-namespace", "", "namespace containing the worker DaemonSet (default $POD_NAMESPACE)")
+	cmd.Flags().StringVar(&captureDaemonSet, "capture-daemonset", "k8shark-worker", "worker DaemonSet to manage when on-demand capture is enabled")
+	cmd.Flags().DurationVar(&captureDefaultDuration, "capture-default-duration", 15*time.Minute, "default on-demand capture session duration")
+	cmd.Flags().DurationVar(&captureMaxDuration, "capture-max-duration", time.Hour, "maximum on-demand capture session duration")
 	return cmd
 }

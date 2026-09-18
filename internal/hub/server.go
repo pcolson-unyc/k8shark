@@ -71,6 +71,13 @@ type Options struct {
 	ExportFileMaxBytes    int64
 	ExportWebhook         string
 	ExportWebhookInterval time.Duration
+	// OnDemandCapture enables Kubernetes-backed worker lifecycle sessions.
+	// It is opt-in; the zero value retains the continuous DaemonSet behavior.
+	OnDemandCapture        bool
+	CaptureNamespace       string
+	CaptureDaemonSet       string
+	CaptureDefaultDuration time.Duration
+	CaptureMaxDuration     time.Duration
 }
 
 // Server is the hub. Construct with New and start with Run.
@@ -116,6 +123,7 @@ type Server struct {
 	resolver *resolver // k8s IP -> pod/service name enrichment (no-op off-cluster)
 
 	exporter *exporter // optional EXT-4 export sink (nil when unconfigured)
+	capture  *captureManager
 
 	uiDir string // optional: serve a built front from here (local dev)
 
@@ -248,6 +256,10 @@ func New(log *slog.Logger, opts Options) *Server {
 		Webhook:         opts.ExportWebhook,
 		WebhookInterval: opts.ExportWebhookInterval,
 	})
+	if opts.OnDemandCapture {
+		s.capture = newCaptureManager(opts.CaptureNamespace, opts.CaptureDaemonSet, opts.CaptureDefaultDuration, opts.CaptureMaxDuration)
+		s.capture.logf = func(format string, args ...any) { log.Warn(fmt.Sprintf(format, args...)) }
+	}
 	// Same-origin by default (plus the --allow-origin list): during a
 	// port-forward without a token — the default — an allow-any policy would
 	// let any web page open in the operator's browser open the WS and exfiltrate
@@ -275,6 +287,9 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/api/pcap", s.handlePcap)
 	mux.HandleFunc("/api/workers", s.handleWorkers)
 	mux.HandleFunc("/api/workers/capture", s.handleWorkerCapture)
+	mux.HandleFunc("/api/capture/session", s.handleCaptureSession)
+	mux.HandleFunc("/api/capture/session/start", s.handleCaptureStart)
+	mux.HandleFunc("/api/capture/session/stop", s.handleCaptureStop)
 	mux.HandleFunc("/api/fields", s.handleFields)
 	mux.HandleFunc("/api/fields/", s.handleFieldValues)
 	mux.HandleFunc("/metrics", s.handleMetrics)
@@ -293,6 +308,9 @@ func (s *Server) handler() http.Handler {
 func (s *Server) Run(ctx context.Context, addr string) error {
 	go s.statsLoop(ctx)
 	go s.resolver.run(ctx)
+	if s.capture != nil {
+		go s.captureLoop(ctx)
+	}
 	if s.exporter != nil {
 		go s.exporter.run(ctx)
 	}
@@ -599,6 +617,97 @@ func (s *Server) handleWorkerCapture(w http.ResponseWriter, r *http.Request) {
 	sent := s.sendWorkerCommand(req.Node, api.WorkerCommand{Paused: req.Paused})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]int{"sent": sent})
+}
+
+func (s *Server) captureUnavailable(w http.ResponseWriter) bool {
+	if s.capture != nil {
+		return false
+	}
+	http.Error(w, "on-demand capture is not enabled", http.StatusNotFound)
+	return true
+}
+
+func (s *Server) handleCaptureSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.captureUnavailable(w) {
+		return
+	}
+	session, err := s.capture.session(r.Context())
+	if err != nil {
+		// Keep a structured state even when the ServiceAccount/API is broken so
+		// the UI can explain why its session controls cannot act.
+		writeJSONStatus(w, CaptureSession{Enabled: true, State: "stopped", Error: err.Error(), DefaultDuration: s.capture.defaultDuration.String(), MaxDuration: s.capture.maxDuration.String()}, http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, session)
+}
+
+func (s *Server) handleCaptureStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.captureUnavailable(w) {
+		return
+	}
+	var req struct {
+		Duration string `json:"duration"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil && err != io.EOF {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	var duration time.Duration
+	var err error
+	if req.Duration != "" {
+		duration, err = time.ParseDuration(req.Duration)
+	}
+	if err != nil {
+		http.Error(w, "invalid duration", http.StatusBadRequest)
+		return
+	}
+	session, err := s.capture.start(r.Context(), duration)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, session)
+}
+
+func (s *Server) handleCaptureStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.captureUnavailable(w) {
+		return
+	}
+	session, err := s.capture.stop(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, session)
+}
+
+func (s *Server) captureLoop(ctx context.Context) {
+	s.capture.reconcile(ctx)
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.capture.reconcile(ctx)
+		}
+	}
 }
 
 // workerUpdate applies fn to node's registry row, creating it on first sight.
@@ -1589,6 +1698,12 @@ func (s *Server) fieldValuesFor(spec FieldSpec, prefix string, limit int) []Fiel
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeJSONStatus(w http.ResponseWriter, v any, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 

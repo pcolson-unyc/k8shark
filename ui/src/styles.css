@@ -187,6 +187,11 @@ body {
 }
 .toggle:hover { color: var(--text); border-color: #33405a; }
 .toggle.active { color: var(--warn); border-color: var(--warn); }
+.capture-session { display: flex; align-items: center; gap: 6px; font-size: 11px; white-space: nowrap; }
+.capture-session select { background: var(--bg-3); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 4px; }
+.capture-state { text-transform: capitalize; color: var(--text-dim); }
+.capture-state.running { color: var(--ok); }.capture-state.starting,.capture-state.stopping { color: var(--warn); }
+.capture-detail,.capture-error { color: var(--text-faint); }.capture-error { color: var(--err); }
 .view-switch { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .view-switch button {
   background: var(--bg-3); border: none; color: var(--text-dim);
