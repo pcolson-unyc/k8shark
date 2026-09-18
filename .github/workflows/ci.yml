@@ -161,15 +161,15 @@ jobs:
 
       - name: helm install (demo mode)
         run: |
+          # This smoke test validates the pre-existing continuous demo stream.
+          # On-demand lifecycle behavior is covered separately; keep workers
+          # active here so the traffic assertion remains valid.
           helm install k8shark helm/k8shark \
             --set image.registry=local \
             --set image.binary=k8shark \
             --set image.front=k8shark-front \
             --set image.tag=e2e \
             --set image.pullPolicy=Never \
-            # This smoke test validates the pre-existing continuous demo
-            # stream. On-demand lifecycle behavior is covered separately;
-            # keep workers active here so the traffic assertion remains valid.
             --set capture.onDemand.enabled=false \
             --set worker.demo=true \
             --wait --timeout=5m
