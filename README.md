@@ -148,9 +148,39 @@ verify a private-CA cert on its `wss://` hub connection).
 | `worker.capture.*` | see values.yaml | Per-direction body/raw capture-depth bounds + header redaction (`redactHeaders`, default on). |
 | `worker.tls.enabled` | `false` | Attach eBPF uprobes to OpenSSL/boringssl to decrypt TLS traffic. Needs `hostPID` + `BPF`/`PERFMON`/`SYS_ADMIN`/`SYS_RESOURCE`/`SYS_PTRACE` and a node with BTF. |
 | `worker.tls.goTLS` | `false` | Go `crypto/tls` uprobes — not implemented yet. |
+| `capture.onDemand.enabled` | `true` | Keep workers stopped until a UI capture session starts; the hub stops them automatically at expiry. Set `false` for legacy always-on capture. |
+| `capture.onDemand.defaultDuration` / `maxDuration` | `15m` / `1h` | Default and bounded maximum duration for an on-demand session. |
 
 See [`helm/k8shark/values.yaml`](helm/k8shark/values.yaml) for the full,
 commented list.
+
+### On-demand capture and Argo CD
+
+Set `capture.onDemand.enabled=true` to run workers only during an expiring
+dashboard session. The hub persists session intent and expiry on the worker
+DaemonSet, reconciles expiry after a hub restart, and needs its included
+namespaced Role limited to `get`/`patch` on that one DaemonSet. If the hub is
+unavailable at the deadline, cleanup happens when it returns.
+
+For Argo CD, ignore only these runtime-owned fields on `DaemonSet/k8shark-worker`
+and enable `RespectIgnoreDifferences=true` on the Application sync options:
+
+```yaml
+ignoreDifferences:
+  - group: apps
+    kind: DaemonSet
+    name: k8shark-worker
+    jqPathExpressions:
+      - .metadata.annotations["k8shark.io/capture-state"]
+      - .metadata.annotations["k8shark.io/capture-expiry"]
+      - .spec.template.spec.schedulingGates[] | select(.name == "k8shark.io/capture-stopped")
+syncPolicy:
+  syncOptions:
+    - RespectIgnoreDifferences=true
+```
+
+Do not ignore the whole pod specification: image, resources, and all other
+Helm scheduling configuration remain GitOps-managed.
 
 ## Protocols dissected
 

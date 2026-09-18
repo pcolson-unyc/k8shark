@@ -18,10 +18,23 @@ metadata:
   labels:
     {{- include "k8shark.labels" . | nindent 4 }}
     app.kubernetes.io/name: k8shark-worker
+  {{- if .Values.capture.onDemand.enabled }}
+  annotations:
+    k8shark.io/capture-state: stopped
+  {{- end }}
 spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: k8shark-worker
+  {{- if .Values.capture.onDemand.enabled }}
+  # A stopped revision must replace every old worker, not stall after one
+  # unavailable pod behind the scheduling gate. This setting is scoped to the
+  # opt-in lifecycle mode; normal DaemonSet rollouts retain Kubernetes defaults.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  {{- end }}
   template:
     metadata:
       labels:
@@ -34,6 +47,12 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- if .Values.capture.onDemand.enabled }}
+      # The hub owns only this gate at runtime. It blocks new scheduling while
+      # leaving node selectors, affinity and tolerations untouched.
+      schedulingGates:
+        - name: k8shark.io/capture-stopped
+      {{- end }}
       serviceAccountName: k8shark-worker
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

@@ -95,6 +95,7 @@ hub:
     # the ca.crt key is mounted, never the private key. Disable when the
     # cert chains to a public/system root.
     caFromSecret: true
+
   resources:
     requests:
       cpu: 100m
@@ -168,6 +169,16 @@ front:
   # podAnnotations / extraLabels: extra metadata on the front pod template.
   podAnnotations: {}
   extraLabels: {}
+
+# capture.onDemand keeps the hub/UI available while only scheduling workers for
+# an explicit, expiring investigation session. It is on by default: a fresh
+# Helm install has no worker pods until an operator starts a capture in the UI.
+# Set enabled=false only for the legacy continuously-capturing DaemonSet mode.
+capture:
+  onDemand:
+    enabled: true
+    defaultDuration: 15m
+    maxDuration: 1h
 
 worker:
   # demo: generate synthetic traffic instead of capturing real packets.

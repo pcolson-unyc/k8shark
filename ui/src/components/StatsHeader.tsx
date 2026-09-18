@@ -1,9 +1,10 @@
-import { memo } from "react";
+import { memo, useEffect, useState } from "react";
 import type { Stats, StatsPoint } from "../types";
 import { PROTO_COLORS } from "../constants";
 import { Sparkline } from "./Sparkline";
 import { useTheme } from "../useTheme";
 import { useWorkers } from "../useWorkers";
+import { useCaptureSession } from "../useCaptureSession";
 
 const STATUS_ORDER = ["success", "warning", "error"] as const;
 
@@ -31,6 +32,9 @@ export const StatsHeader = memo(function StatsHeader({
 }) {
   const { theme, toggleTheme } = useTheme();
   const { workers, setCapturePaused } = useWorkers();
+  const { session, error: captureError, start, stop } = useCaptureSession();
+  const [duration, setDuration] = useState("15m");
+  useEffect(() => { if (session?.defaultDuration) setDuration(session.defaultDuration); }, [session?.defaultDuration]);
   const connectedWorkers = workers.filter((w) => w.connected);
   const capturePaused = connectedWorkers.length > 0 && connectedWorkers.every((w) => w.capturePaused);
 
@@ -100,7 +104,23 @@ export const StatsHeader = memo(function StatsHeader({
         {connected ? "live" : "reconnecting…"}
       </div>
 
-      <button
+      {session ? (
+        <div className="capture-session" aria-live="polite">
+          <span className={`capture-state ${session.state}`}>{session.state}</span>
+          {session.state === "stopped" ? <>
+            <select aria-label="capture duration" value={duration} onChange={(e) => setDuration(e.target.value)}>
+              <option value={session.defaultDuration}>{session.defaultDuration}</option>
+              <option value="30m">30m</option>
+              <option value={session.maxDuration}>{session.maxDuration}</option>
+            </select>
+            <button type="button" className="toggle" onClick={() => start(duration)}>start capture</button>
+          </> : <>
+            <span className="capture-detail">{session.readyWorkers}/{session.desiredWorkers} workers{session.expiresAt ? ` · ${remaining(session.expiresAt)} left` : ""}</span>
+            <button type="button" className="toggle active" onClick={stop} disabled={session.state === "stopping"}>stop capture</button>
+          </>}
+          {captureError && <span className="capture-error" title={captureError}>⚠ capture unavailable</span>}
+        </div>
+      ) : <button
         type="button"
         className={`toggle capture-toggle${capturePaused ? " active" : ""}`}
         onClick={() => setCapturePaused(!capturePaused)}
@@ -114,7 +134,7 @@ export const StatsHeader = memo(function StatsHeader({
         }
       >
         {capturePaused ? "▶ resume capture" : "⏸ pause capture"}
-      </button>
+      </button>}
 
       <button
         type="button"
@@ -142,4 +162,9 @@ function fmt(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
   if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
   return String(n);
+}
+
+function remaining(expiresAt: string): string {
+  const seconds = Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 1_000));
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }

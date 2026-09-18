@@ -6,6 +6,39 @@ metadata:
   labels:
     {{- include "k8shark.labels" . | nindent 4 }}
 ---
+{{- if .Values.capture.onDemand.enabled }}
+# Narrow runtime authority for capture sessions. The hub can only read/patch
+# its own worker DaemonSet; it cannot delete pods or change any other object.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8shark-capture-session
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8shark.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["k8shark-worker"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8shark-capture-session
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8shark.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k8shark-capture-session
+subjects:
+  - kind: ServiceAccount
+    name: k8shark-hub
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
 # Read-only enrichment permissions: the hub maps captured IPs to pod/service/
 # workload names by listing the API (internal/hub/k8s.go). Without this the
 # hub still runs — entries just keep bare ip:port endpoints.
@@ -128,6 +161,13 @@ spec:
             - hub
             - --port={{ .Values.hub.port }}
             - --log-level={{ .Values.logLevel }}
+            {{- if .Values.capture.onDemand.enabled }}
+            - --on-demand-capture
+            - --capture-namespace={{ .Release.Namespace }}
+            - --capture-daemonset=k8shark-worker
+            - --capture-default-duration={{ .Values.capture.onDemand.defaultDuration }}
+            - --capture-max-duration={{ .Values.capture.onDemand.maxDuration }}
+            {{- end }}
             {{- if .Values.hub.bufferSize }}
             - --buffer={{ .Values.hub.bufferSize }}
             {{- end }}
