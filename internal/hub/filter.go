@@ -364,11 +364,45 @@ func (p *parser) parseComparison() (Predicate, error) {
 	if getter == nil {
 		return nil, fmt.Errorf("unknown filter field %q (GET /api/fields lists the catalog)", field)
 	}
+	if ng := numericFieldGetter(field); ng != nil && isRelational(op) {
+		match, err := numericValueMatcher(field, op, val, ng)
+		if err != nil {
+			return nil, err
+		}
+		return match, nil
+	}
 	match, err := valueMatcher(field, op, val)
 	if err != nil {
 		return nil, err
 	}
 	return func(e *api.Entry) bool { return match(getter(e)) }, nil
+}
+
+func isRelational(op string) bool {
+	return op == ">" || op == "<" || op == ">=" || op == "<="
+}
+
+func numericValueMatcher(field, op, want string, getter func(*api.Entry) (float64, bool)) (Predicate, error) {
+	wf, err := strconv.ParseFloat(want, 64)
+	if err != nil {
+		return nil, fmt.Errorf("field %q: operator %q needs a numeric value, got %q", field, op, want)
+	}
+	return func(e *api.Entry) bool {
+		v, ok := getter(e)
+		if !ok {
+			return false
+		}
+		switch op {
+		case ">":
+			return v > wf
+		case "<":
+			return v < wf
+		case ">=":
+			return v >= wf
+		default:
+			return v <= wf
+		}
+	}, nil
 }
 
 // parseInList parses a parenthesized, comma-separated literal list after
@@ -505,6 +539,154 @@ func valueMatcher(field, op, want string) (func(actual string) bool, error) {
 	// plus in/matches/startswith, which parseComparison peels off first), but an
 	// error beats a predicate that silently matches nothing.
 	return nil, fmt.Errorf("field %q: unsupported operator %q", field, op)
+}
+
+// numericFieldGetter returns typed accessors for fields whose wire values are
+// numeric. Unknown and dynamic fields intentionally return nil so relational
+// comparisons retain the string/ParseFloat fallback in valueMatcher.
+func numericFieldGetter(field string) func(*api.Entry) (float64, bool) {
+	switch strings.ToLower(field) {
+	case "elapsedms", "elapsed", "latency":
+		return func(e *api.Entry) (float64, bool) { return float64(e.ElapsedMs), true }
+	case "src.port":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Source.Port), true }
+	case "dst.port":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Destination.Port), true }
+	case "response.status", "http.status", "status.code", "statuscode":
+		return func(e *api.Entry) (float64, bool) { return float64(e.StatusCode), true }
+	case "bytes":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Request.Bytes), true }
+	case "packets":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Request.Packets), true }
+	case "request.size":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Request.Size), true }
+	case "response.size", "size":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Response.Size), true }
+	case "redis.db":
+		return func(e *api.Entry) (float64, bool) {
+			if e.Request.Redis == nil {
+				return 0, false
+			}
+			return float64(e.Request.Redis.DBIndex), true
+		}
+	case "redis.pipelinedepth":
+		return func(e *api.Entry) (float64, bool) {
+			if e.Request.Redis == nil {
+				return 0, false
+			}
+			return float64(e.Request.Redis.PipelineDepth), true
+		}
+	case "mysql.error":
+		return func(e *api.Entry) (float64, bool) {
+			if e.Response.MySQL == nil || e.Response.MySQL.ErrorCode == 0 {
+				return 0, false
+			}
+			return float64(e.Response.MySQL.ErrorCode), true
+		}
+	case "l4.ttl":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.TTL), true
+		}
+	case "l4.retransmits":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.Retransmits), true
+		}
+	case "l4.window":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.Window), true
+		}
+	case "l4.mss":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.MSS), true
+		}
+	case "l4.rttms":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return e.L4.RTTMs, true
+		}
+	case "l4.durationms":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.DurationMs), true
+		}
+	case "l4.clientbytes":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.ClientBytes), true
+		}
+	case "l4.serverbytes":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.ServerBytes), true
+		}
+	case "amqp.deliverytag", "deliverytag":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Request.DeliveryTag), true }
+	case "postgres.rowcount", "rowcount":
+		return func(e *api.Entry) (float64, bool) { return float64(e.Response.RowCount), true }
+	case "http.ttfbms":
+		return func(e *api.Entry) (float64, bool) {
+			if e.Response.HTTP == nil {
+				return 0, false
+			}
+			return float64(e.Response.HTTP.TTFBMs), true
+		}
+	case "l4.ipversion":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.IPVersion), true
+		}
+	case "l4.seqstart":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.SeqStart), true
+		}
+	case "l4.ackstart":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.AckStart), true
+		}
+	case "l4.clientpackets":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.ClientPackets), true
+		}
+	case "l4.serverpackets":
+		return func(e *api.Entry) (float64, bool) {
+			if e.L4 == nil {
+				return 0, false
+			}
+			return float64(e.L4.ServerPackets), true
+		}
+	}
+	return nil
 }
 
 // fieldGetter resolves a dotted field path to an accessor. Unknown fields
