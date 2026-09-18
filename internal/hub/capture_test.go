@@ -78,7 +78,7 @@ func TestCaptureSessionReportsUnavailableKubernetesAccess(t *testing.T) {
 	// stopped/healthy session.
 	rec := httptest.NewRecorder()
 	s.handleCaptureSession(rec, httptest.NewRequest(http.MethodGet, "/api/capture/session", nil))
-	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "Kubernetes access is unavailable") {
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "kubernetes access is unavailable") {
 		t.Fatalf("session response = %d %s", rec.Code, rec.Body.String())
 	}
 }
