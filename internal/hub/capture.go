@@ -95,7 +95,7 @@ func (m *captureManager) available() bool { return m != nil && m.client != nil }
 
 func (m *captureManager) session(ctx context.Context) (CaptureSession, error) {
 	if !m.available() {
-		return CaptureSession{}, fmt.Errorf("Kubernetes access is unavailable; on-demand capture requires the hub ServiceAccount")
+		return CaptureSession{}, fmt.Errorf("kubernetes access is unavailable; on-demand capture requires the hub ServiceAccount")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -108,7 +108,7 @@ func (m *captureManager) session(ctx context.Context) (CaptureSession, error) {
 
 func (m *captureManager) start(ctx context.Context, duration time.Duration) (CaptureSession, error) {
 	if !m.available() {
-		return CaptureSession{}, fmt.Errorf("Kubernetes access is unavailable; on-demand capture requires the hub ServiceAccount")
+		return CaptureSession{}, fmt.Errorf("kubernetes access is unavailable; on-demand capture requires the hub ServiceAccount")
 	}
 	if duration == 0 {
 		duration = m.defaultDuration
@@ -140,7 +140,7 @@ func (m *captureManager) start(ctx context.Context, duration time.Duration) (Cap
 
 func (m *captureManager) stop(ctx context.Context) (CaptureSession, error) {
 	if !m.available() {
-		return CaptureSession{}, fmt.Errorf("Kubernetes access is unavailable; on-demand capture requires the hub ServiceAccount")
+		return CaptureSession{}, fmt.Errorf("kubernetes access is unavailable; on-demand capture requires the hub ServiceAccount")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
