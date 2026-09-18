@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -197,9 +198,10 @@ const (
 // behavior: pausing them wouldn't free any comparable resource, and a pcap
 // file's channel closing on EOF must still read as "done", not "paused".
 func captureLoop(ctx context.Context, log *slog.Logger, p *pipeline, src capture.PacketSource, reopen func() (capture.PacketSource, error)) error {
-	assembler := tcpassembly.NewAssembler(tcpassembly.NewStreamPool(&tcpStreamFactory{p: p}))
-	assembler.MaxBufferedPagesTotal = maxBufferedPagesTotal
-	assembler.MaxBufferedPagesPerConnection = maxBufferedPagesPerConnection
+	var liveStreams atomic.Int64
+	var streamCreates atomic.Uint64
+	assembler := newWorkerAssembler(p, &liveStreams, &streamCreates)
+	assemblerCreated := streamCreates.Load()
 
 	var packets <-chan gopacket.Packet
 	if src != nil {
@@ -251,6 +253,11 @@ func captureLoop(ctx context.Context, log *slog.Logger, p *pipeline, src capture
 			}
 		case <-flush.C:
 			assembler.FlushOlderThan(time.Now().Add(-2 * time.Minute))
+			// tcpassembly's page cache retains its peak allocation for the
+			// lifetime of an Assembler. Retire it only after the normal stale
+			// flush has closed every stream; active connections keep their
+			// reassembly state and stay on the same assembler.
+			assembler = reclaimWorkerAssembler(assembler, p, &liveStreams, &streamCreates, &assemblerCreated)
 			// Piggyback the ring-stats probe on the same 30s ticker rather
 			// than adding a dedicated one — this is a coarse "is the kernel
 			// dropping packets" gauge, not something that needs tighter
@@ -279,6 +286,22 @@ func captureLoop(ctx context.Context, log *slog.Logger, p *pipeline, src capture
 			p.route(assembler, pkt)
 		}
 	}
+}
+
+func newWorkerAssembler(p *pipeline, liveStreams *atomic.Int64, streamCreates *atomic.Uint64) *tcpassembly.Assembler {
+	a := tcpassembly.NewAssembler(tcpassembly.NewStreamPool(&tcpStreamFactory{p: p, liveStreams: liveStreams, streamCreates: streamCreates}))
+	a.MaxBufferedPagesTotal = maxBufferedPagesTotal
+	a.MaxBufferedPagesPerConnection = maxBufferedPagesPerConnection
+	return a
+}
+
+func reclaimWorkerAssembler(a *tcpassembly.Assembler, p *pipeline, liveStreams *atomic.Int64, streamCreates *atomic.Uint64, assemblerCreated *uint64) *tcpassembly.Assembler {
+	if liveStreams.Load() != 0 || streamCreates.Load() == *assemblerCreated {
+		return a
+	}
+	newAssembler := newWorkerAssembler(p, liveStreams, streamCreates)
+	*assemblerCreated = streamCreates.Load()
+	return newAssembler
 }
 
 // buildRespPorts merges the default RESP port (6379 -> redis) with operator
