@@ -128,3 +128,62 @@ func TestDecodeEventUnknownFamilyIgnoresAddr(t *testing.T) {
 		t.Errorf("ips = %q/%q, want empty (unknown family)", rec.SrcIP, rec.DstIP)
 	}
 }
+
+func TestDecodeEventPayloadBoundaries(t *testing.T) {
+	for _, n := range []int{1, 16383, 16384, 16385} {
+		raw := make([]byte, eventOffData+n)
+		binary.LittleEndian.PutUint32(raw[eventOffDataLen:], uint32(n))
+		for i := range raw[eventOffData:] {
+			raw[eventOffData+i] = byte(i)
+		}
+		rec, err := decodeEvent(raw)
+		if err != nil {
+			t.Fatalf("length %d: %v", n, err)
+		}
+		if len(rec.Data) != n || rec.Lagged {
+			t.Errorf("length %d: got data=%d lagged=%v", n, len(rec.Data), rec.Lagged)
+		}
+	}
+}
+
+func TestDecodeEventLaggedTombstone(t *testing.T) {
+	raw := make([]byte, eventOffData)
+	binary.LittleEndian.PutUint32(raw[eventOffDataLen:], eventFlagLagged)
+	rec, err := decodeEvent(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.Lagged || len(rec.Data) != 0 {
+		t.Fatalf("tombstone = lagged=%v data=%d, want lagged with no data", rec.Lagged, len(rec.Data))
+	}
+}
+
+func TestLossMarkerRetriesFullQueueAndSuppressesTail(t *testing.T) {
+	out := make(chan TLSRecord, 1)
+	out <- TLSRecord{ConnID: 99}
+	lagged := map[uint64]bool{}
+	ev := TLSRecord{ConnID: 42, Data: []byte("must not reach parser")}
+	forwardLoss(out, lagged, ev)
+	if sent, ok := lagged[42]; !ok || sent {
+		t.Fatal("full queue must leave loss marker pending")
+	}
+	<-out
+	forwardLoss(out, lagged, ev)
+	marker := <-out
+	if !marker.Lagged || marker.ConnID != 42 || len(marker.Data) != 0 {
+		t.Fatalf("invalid marker: %+v", marker)
+	}
+	forwardLoss(out, lagged, ev)
+	if len(out) != 0 {
+		t.Fatal("tail forwarded after delivered loss marker")
+	}
+}
+
+func TestTerminalEventDoesNotCopyPayload(t *testing.T) {
+	raw := make([]byte, eventOffData+16384)
+	binary.LittleEndian.PutUint32(raw[eventOffDataLen:], eventFlagLagged|16384)
+	rec, err := decodeEvent(raw)
+	if err != nil || !rec.Lagged || len(rec.Data) != 0 {
+		t.Fatalf("terminal decode: %+v, %v", rec, err)
+	}
+}
