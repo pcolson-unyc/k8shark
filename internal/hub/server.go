@@ -49,7 +49,8 @@ type Options struct {
 	// users. Empty falls back to APIToken.
 	AdminToken string
 	// BufferSize overrides the in-memory entry ring size (0 = default).
-	BufferSize int
+	BufferSize  int
+	BufferBytes int64
 	// AllowedOrigins lists extra browser Origins granted API/WebSocket access
 	// and CORS headers, on top of the same-origin default (Origin host ==
 	// request Host). "*" restores the old allow-any behavior.
@@ -146,12 +147,15 @@ const workerReadLimit = 4 << 20
 
 // New builds a hub.
 func New(log *slog.Logger, opts Options) *Server {
+	if opts.BufferBytes < 0 {
+		opts.BufferBytes = 0
+	}
 	size := opts.BufferSize
 	if size <= 0 {
 		size = config.EntryBufferSize
 	}
 	s := &Server{
-		store:        newStore(size),
+		store:        newStore(size, opts.BufferBytes),
 		log:          log,
 		apiToken:     opts.APIToken,
 		workerToken:  opts.WorkerToken,
@@ -1344,6 +1348,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"Ring buffer slots currently filled.", strconv.Itoa(s.store.size()))
 	metric("k8shark_hub_buffer_capacity", "gauge",
 		"Ring buffer capacity (max entries retained).", strconv.Itoa(s.store.capacity))
+	s.store.mu.RLock()
+	used, budget := s.store.retainedBytes, s.store.byteBudget
+	s.store.mu.RUnlock()
+	metric("k8shark_hub_buffer_bytes", "gauge", "Serialized JSON bytes currently retained (not process RSS).", strconv.FormatInt(used, 10))
+	metric("k8shark_hub_buffer_bytes_budget", "gauge", "Serialized JSON byte retention budget (not process RSS).", strconv.FormatInt(budget, 10))
 	metric("k8shark_hub_k8s_enrich_failures_total", "counter",
 		"Failed k8s enrichment refresh cycles (e.g. broken RBAC).", strconv.FormatInt(s.resolver.failures(), 10))
 

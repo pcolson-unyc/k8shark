@@ -115,7 +115,7 @@ headers, on by default), `--enable-tls` / `--proc-root` (eBPF TLS capture),
 `--pcap-file` (replay a pcap file through the dissectors instead of live
 capture — offline analysis, works on any OS), `--hub-token` (hub auth).
 
-Hub flags of note: `--buffer` (in-memory entry ring size), `--api-token`
+Hub flags of note: `--buffer` (in-memory entry ring size), `--buffer-bytes` (serialized JSON history budget; not RSS), `--api-token`
 (require a bearer token on `/api` and the WebSocket endpoints; also read from
 `$K8SHARK_API_TOKEN`), `--worker-token` / `--admin-token` (distinct
 credentials for the worker ingest channel and the mutating control endpoints;

@@ -19,6 +19,7 @@ func hubCmd() *cobra.Command {
 	var workerToken string
 	var adminToken string
 	var bufferSize int
+	var bufferBytes int64
 	var allowOrigins []string
 	var tlsCert, tlsKey string
 	var exportFile, exportWebhook string
@@ -30,6 +31,9 @@ func hubCmd() *cobra.Command {
 		Long: "Runs the central hub that receives entries from workers and streams\n" +
 			"them to front-end clients. This is what the hub container runs.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if bufferSize < 0 || bufferBytes < 0 {
+				return fmt.Errorf("--buffer and --buffer-bytes must be non-negative")
+			}
 			if apiToken == "" {
 				apiToken = os.Getenv("K8SHARK_API_TOKEN")
 			}
@@ -48,6 +52,7 @@ func hubCmd() *cobra.Command {
 				WorkerToken:           workerToken,
 				AdminToken:            adminToken,
 				BufferSize:            bufferSize,
+				BufferBytes:           bufferBytes,
 				AllowedOrigins:        allowOrigins,
 				TLSCert:               tlsCert,
 				TLSKey:                tlsKey,
@@ -67,6 +72,7 @@ func hubCmd() *cobra.Command {
 	cmd.Flags().StringVar(&workerToken, "worker-token", "", "distinct bearer token required on /ws/worker (default $K8SHARK_WORKER_TOKEN; empty falls back to the API token)")
 	cmd.Flags().StringVar(&adminToken, "admin-token", "", "distinct bearer token required on mutating /api calls, also grants reads (default $K8SHARK_ADMIN_TOKEN; empty falls back to the API token)")
 	cmd.Flags().IntVar(&bufferSize, "buffer", 0, "in-memory entry buffer size (0 = default 10000)")
+	cmd.Flags().Int64Var(&bufferBytes, "buffer-bytes", 0, "serialized history byte budget (0 = default 64MiB)")
 	cmd.Flags().StringArrayVar(&allowOrigins, "allow-origin", nil, "extra browser Origin allowed on the API and WebSockets, repeatable (default: same-origin only; \"*\" allows any)")
 	cmd.Flags().StringVar(&tlsCert, "tls-cert", "", "PEM certificate file; with --tls-key, serve HTTPS/wss instead of plain HTTP")
 	cmd.Flags().StringVar(&tlsKey, "tls-key", "", "PEM private key file for --tls-cert")
