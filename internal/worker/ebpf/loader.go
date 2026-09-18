@@ -138,13 +138,19 @@ type linuxSource struct {
 
 	out chan TLSRecord
 
-	mu       sync.Mutex
-	attached map[string]bool // devIno -> attached, guards re-attach on rescan
-	links    []link.Link
+	mu          sync.Mutex
+	attached    map[string]*attachment // devIno -> owned dynamic uprobes
+	staticLinks []link.Link
+	grace       time.Duration
 
 	closeOnce sync.Once
 	stop      chan struct{}
 	wg        sync.WaitGroup
+}
+
+type attachment struct {
+	links    []link.Link
+	lastSeen time.Time
 }
 
 func newSource(cfg Config) (Source, error) {
@@ -155,7 +161,8 @@ func newSource(cfg Config) (Source, error) {
 	s := &linuxSource{
 		cfg:      cfg,
 		out:      make(chan TLSRecord, 4096),
-		attached: map[string]bool{},
+		attached: map[string]*attachment{},
+		grace:    60 * time.Second,
 		stop:     make(chan struct{}),
 	}
 	if err := loadTlsObjects(&s.objs, nil); err != nil {
@@ -198,7 +205,7 @@ func (s *linuxSource) Attach() error {
 			continue
 		}
 		s.mu.Lock()
-		s.links = append(s.links, l)
+		s.staticLinks = append(s.staticLinks, l)
 		s.mu.Unlock()
 	}
 
@@ -320,7 +327,7 @@ func (s *linuxSource) scanLoop() {
 }
 
 func (s *linuxSource) rescan() {
-	targets, err := discoverTargets(s.cfg.ProcRoot, s.cfg.Log)
+	targets, complete, err := discoverTargets(s.cfg.ProcRoot, s.cfg.Log)
 	if err != nil {
 		s.cfg.Log.Warn("ebpf: discover targets", "err", err)
 		return
@@ -328,20 +335,52 @@ func (s *linuxSource) rescan() {
 	prog := probeNames(&s.objs)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reconcileAttachments(targets, complete, time.Now(), func(t libTarget) ([]link.Link, error) {
+		return attachTarget(prog, t, s.cfg.Log)
+	})
+}
+
+// Caller owns mu; keeping discovery and attachment injection separate allows
+// lifecycle checks without installing real kernel probes.
+func (s *linuxSource) reconcileAttachments(targets []libTarget, complete bool, now time.Time, attach func(libTarget) ([]link.Link, error)) {
 	for _, t := range targets {
-		if s.attached[t.devIno] {
+		if a := s.attached[t.devIno]; a != nil {
+			a.lastSeen = now
 			continue
 		}
-		links, err := attachTarget(prog, t, s.cfg.Log)
+		links, err := attach(t)
 		if err != nil {
 			s.cfg.Log.Debug("ebpf: attach failed", "lib", t.pathname, "pid", t.pid, "err", err)
 			// Not marked attached: retry on the next rescan (the process
 			// might still be starting up, e.g. its libssl mapping raced us).
 			continue
 		}
-		s.attached[t.devIno] = true
-		s.links = append(s.links, links...)
+		s.attached[t.devIno] = &attachment{links: links, lastSeen: now}
 		s.cfg.Log.Info("ebpf: attached TLS uprobes", "lib", t.pathname, "pid", t.pid, "hooks", len(links))
+	}
+	if complete {
+		for key, a := range s.attached {
+			if now.Sub(a.lastSeen) <= s.grace {
+				continue
+			}
+			for _, l := range a.links {
+				_ = l.Close()
+			}
+			delete(s.attached, key)
+		}
+	}
+}
+
+func (s *linuxSource) closeAttachments() {
+	for _, l := range s.staticLinks {
+		_ = l.Close()
+	}
+	s.staticLinks = nil
+	for key, a := range s.attached {
+		for _, l := range a.links {
+			_ = l.Close()
+		}
+		delete(s.attached, key)
 	}
 }
 
@@ -352,9 +391,7 @@ func (s *linuxSource) Close() error {
 		s.wg.Wait()
 
 		s.mu.Lock()
-		for _, l := range s.links {
-			_ = l.Close()
-		}
+		s.closeAttachments()
 		s.mu.Unlock()
 
 		s.objs.Close()
