@@ -100,7 +100,8 @@ type sink struct {
 	// tlsLagDrops counts eBPF TLS streams abandoned because backpressure
 	// dropped one of their interior chunks (see ebpf.TLSRecord.Lagged) —
 	// closed with a clean truncation instead of misparsing past a hole.
-	tlsLagDrops atomic.Uint64
+	tlsLagDrops    atomic.Uint64
+	tlsBudgetDrops atomic.Uint64
 
 	// tcpLossEvents counts AF_PACKET TCP stream directions truncated after a
 	// lost segment surfaced as tcpreader.DataLost (LossErrors): the
@@ -337,17 +338,18 @@ func (s *sink) pump(ctx context.Context) {
 			return
 		case <-stats.C:
 			b, err := json.Marshal(api.Envelope{Type: api.MsgWorkerStats, WorkerStats: &api.WorkerStats{
-				Node:          s.node,
-				EntriesSent:   s.sent.Load(),
-				Dropped:       s.dropped.Load(),
-				CaptureLive:   s.captureLive.Load(),
-				CaptureTLS:    s.captureTLS.Load(),
-				CapturePaused: s.capturePaused.Load(),
-				RingPackets:   s.ringPackets.Load(),
-				RingDrops:     s.ringDrops.Load(),
-				FlowsEvicted:  s.flowsEvicted.Load(),
-				TLSLagDrops:   s.tlsLagDrops.Load(),
-				TCPLossEvents: s.tcpLossEvents.Load(),
+				Node:           s.node,
+				EntriesSent:    s.sent.Load(),
+				Dropped:        s.dropped.Load(),
+				CaptureLive:    s.captureLive.Load(),
+				CaptureTLS:     s.captureTLS.Load(),
+				CapturePaused:  s.capturePaused.Load(),
+				RingPackets:    s.ringPackets.Load(),
+				RingDrops:      s.ringDrops.Load(),
+				FlowsEvicted:   s.flowsEvicted.Load(),
+				TLSLagDrops:    s.tlsLagDrops.Load(),
+				TLSBudgetDrops: s.tlsBudgetDrops.Load(),
+				TCPLossEvents:  s.tcpLossEvents.Load(),
 			}})
 			if err != nil {
 				continue
